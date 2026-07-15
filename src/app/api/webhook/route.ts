@@ -203,6 +203,54 @@ Budi Santoso - 2401021 - WiFi perpustakaan mati`
             });
         }
 
+        // ==========================
+        // HANDLE TICKET REPLY (Menunggu Balasan)
+        // ==========================
+        const { data: waitingTickets } = await supabaseService
+            .from('wa_tickets')
+            .select('id')
+            .eq('wa_number', senderNumber)
+            .eq('status', 'waiting_for_user')
+            .order('created_at', { ascending: false })
+            .limit(1);
+
+        if (waitingTickets && waitingTickets.length > 0) {
+            const ticketId = waitingTickets[0].id;
+            const isClosing = ['selesai', 'sudah', 'closed', 'ok'].includes(textLower);
+
+            if (isClosing) {
+                await supabaseService
+                    .from('wa_tickets')
+                    .update({ status: 'closed' })
+                    .eq('id', ticketId);
+
+                await sendWhatsAppMessage(
+                    senderNumber,
+                    '✅ *Tiket Ditutup*\n\nTerima kasih atas konfirmasinya. Tiket Anda telah selesai dan ditutup.'
+                );
+
+                return NextResponse.json({
+                    status: 'success',
+                    action: 'ticket_closed_by_user',
+                });
+            } else {
+                await supabaseService
+                    .from('wa_tickets')
+                    .update({ status: 'in_progress' })
+                    .eq('id', ticketId);
+
+                await sendWhatsAppMessage(
+                    senderNumber,
+                    '🔄 *Tiket Dibuka Kembali*\n\nPesan Anda telah kami terima. Tim Helpdesk IT akan segera mengeceknya kembali.'
+                );
+
+                return NextResponse.json({
+                    status: 'success',
+                    action: 'ticket_reopened_by_user',
+                });
+            }
+        }
+
         return NextResponse.json({
             status: 'ignored',
             reason: 'Perintah tidak dikenali',
