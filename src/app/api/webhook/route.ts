@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { supabase } from '../../../lib/supabase';
+import { supabaseService } from '@/src/lib/supabase/service';
 
 async function sendWhatsAppMessage(to: string, text: string) {
     const url = 'https://www.wasenderapi.com/api/send-message';
@@ -9,9 +9,12 @@ async function sendWhatsAppMessage(to: string, text: string) {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
-            'Authorization': `Bearer ${token}`
+            Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({ to, text }) // <-- field yang benar: to & text
+        body: JSON.stringify({
+            to,
+            text,
+        }),
     });
 
     if (!res.ok) {
@@ -21,46 +24,110 @@ async function sendWhatsAppMessage(to: string, text: string) {
 
 export async function POST(request: Request) {
     try {
-        // Verifikasi webhook signature dulu
+        // Verifikasi signature webhook
         const signature = request.headers.get('x-webhook-signature');
+
         if (signature !== process.env.WASENDER_WEBHOOK_SECRET) {
-            return NextResponse.json({ error: 'Invalid signature' }, { status: 401 });
+            return NextResponse.json(
+                { error: 'Invalid signature' },
+                { status: 401 }
+            );
         }
 
         const body = await request.json();
 
-        // Cuma proses event pesan masuk, abaikan event lain (session status, dll)
+        // Hanya proses pesan masuk
         if (body.event !== 'messages.received') {
-            return NextResponse.json({ status: 'ignored', reason: 'Bukan event pesan' });
+            return NextResponse.json({
+                status: 'ignored',
+                reason: 'Bukan event pesan',
+            });
         }
 
         const msg = body.data?.messages;
-        const messageText: string | undefined = msg?.messageBody?.trim();
-        const senderNumber: string | undefined =
-            msg?.key?.cleanedSenderPn ?? msg?.key?.cleanedParticipantPn;
+
+        const messageText =
+            typeof msg?.messageBody === 'string'
+                ? msg.messageBody.trim()
+                : undefined;
+
+        const senderNumber =
+            msg?.key?.cleanedSenderPn ??
+            msg?.key?.cleanedParticipantPn;
 
         if (!messageText || !senderNumber) {
-            return NextResponse.json({ status: 'ignored', reason: 'Bukan pesan teks' });
+            return NextResponse.json({
+                status: 'ignored',
+                reason: 'Bukan pesan teks',
+            });
         }
 
         const textLower = messageText.toLowerCase();
 
-        // SKENARIO 1: User ketik "HaloDesk"
+        // ==========================
+        // MENU AWAL
+        // ==========================
         if (textLower === 'halodesk') {
-            const menu = `🤖 *Bot Helpdesk IT Undip*\n\nHalo! Selamat datang di Pusat Bantuan IT. Silakan balas dengan angka:\n*1.* 📝 Lapor Kendala\n*2.* 🔍 Cek Status\n\n_Ketik HaloDesk kapan saja untuk kembali._`;
+            const menu = `🤖 *Bot Helpdesk IT Undip*
+
+Halo! Selamat datang di Pusat Bantuan IT.
+
+Silakan pilih menu:
+
+*1.* 📝 Lapor Kendala
+*2.* 🔍 Cek Status
+
+_Ketik HaloDesk kapan saja untuk kembali ke menu._`;
+
             await sendWhatsAppMessage(senderNumber, menu);
-            return NextResponse.json({ status: 'success', action: 'menu_sent' });
+
+            return NextResponse.json({
+                status: 'success',
+                action: 'menu_sent',
+            });
         }
 
-        // SKENARIO 2: User balas "1"
+        // ==========================
+        // MENU 1
+        // ==========================
         if (textLower === '1') {
-            const reply = `Baik, mari kita buat tiket baru.\n\nSilakan balas pesan ini dengan format:\n*NAMA - NIM - KELUHAN*\n\nContoh: Budi Santoso - 2401021 - WiFi perpus mati`;
-            await sendWhatsAppMessage(senderNumber, reply);
-            return NextResponse.json({ status: 'success', action: 'instruction_sent' });
+            const instruction = `Baik, mari kita buat tiket baru.
+
+Silakan balas dengan format berikut:
+
+*NAMA - NIM - KELUHAN*
+
+Contoh:
+
+Budi Santoso - 2401021 - WiFi perpustakaan mati`;
+
+            await sendWhatsAppMessage(senderNumber, instruction);
+
+            return NextResponse.json({
+                status: 'success',
+                action: 'instruction_sent',
+            });
         }
 
-        // SKENARIO 3: Format laporan (mengandung " - ")
-        if (textLower.includes(' - ')) {
+        // ==========================
+        // MENU 2
+        // ==========================
+        if (textLower === '2') {
+            const reply =
+                'Fitur cek status tiket masih dalam pengembangan. Silakan hubungi admin Helpdesk untuk informasi sementara.';
+
+            await sendWhatsAppMessage(senderNumber, reply);
+
+            return NextResponse.json({
+                status: 'success',
+                action: 'status_info_sent',
+            });
+        }
+
+        // ==========================
+        // FORMAT TIKET
+        // ==========================
+        if (messageText.includes(' - ')) {
             const parts = messageText.split(' - ');
 
             if (parts.length >= 3) {
@@ -68,29 +135,88 @@ export async function POST(request: Request) {
                 const nim = parts[1].trim();
                 const complaint = parts.slice(2).join(' - ').trim();
 
-                const { error } = await supabase
+                const { error } = await supabaseService
                     .from('wa_tickets')
-                    .insert([{
-                        wa_number: senderNumber,
-                        reporter_name: name,
-                        reporter_nim: nim,
-                        description: complaint
-                    }]);
+                    .insert([
+                        {
+                            wa_number: senderNumber,
+                            reporter_name: name,
+                            reporter_nim: nim,
+                            description: complaint,
+                        },
+                    ]);
 
                 if (error) {
                     console.error('Supabase Error:', error);
-                    await sendWhatsAppMessage(senderNumber, 'Maaf, sistem sedang gangguan. Coba lagi nanti.');
-                } else {
-                    await sendWhatsAppMessage(senderNumber, `✅ *Laporan Diterima!*\n\nNama: ${name}\nNIM: ${nim}\nKendala: ${complaint}\n\nTiket kamu sudah masuk ke antrean staf IT kami.`);
+
+                    await sendWhatsAppMessage(
+                        senderNumber,
+                        '❌ Maaf, sistem sedang mengalami gangguan. Silakan coba beberapa saat lagi.'
+                    );
+
+                    return NextResponse.json(
+                        {
+                            status: 'error',
+                            action: 'insert_failed',
+                        },
+                        { status: 500 }
+                    );
                 }
-                return NextResponse.json({ status: 'success', action: 'ticket_created' });
+
+                await sendWhatsAppMessage(
+                    senderNumber,
+                    `✅ *Laporan Berhasil Diterima!*
+
+Nama: ${name}
+NIM: ${nim}
+
+Kendala:
+${complaint}
+
+Tiket kamu sudah masuk ke antrean Helpdesk IT.
+
+Terima kasih 🙏`
+                );
+
+                return NextResponse.json({
+                    status: 'success',
+                    action: 'ticket_created',
+                });
             }
+
+            await sendWhatsAppMessage(
+                senderNumber,
+                `Format belum benar.
+
+Gunakan format:
+
+*NAMA - NIM - KELUHAN*
+
+Contoh:
+
+Budi Santoso - 2401021 - WiFi perpustakaan mati`
+            );
+
+            return NextResponse.json({
+                status: 'success',
+                action: 'invalid_format',
+            });
         }
 
-        return NextResponse.json({ status: 'ignored', reason: 'Perintah tidak dikenali' });
-
+        return NextResponse.json({
+            status: 'ignored',
+            reason: 'Perintah tidak dikenali',
+        });
     } catch (error) {
         console.error('Webhook Error:', error);
-        return NextResponse.json({ error: 'Internal Server Error' }, { status: 500 });
+
+        return NextResponse.json(
+            {
+                error: 'Internal Server Error',
+            },
+            {
+                status: 500,
+            }
+        );
     }
 }
