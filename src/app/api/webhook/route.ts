@@ -1,31 +1,43 @@
 import { NextResponse } from 'next/server';
 import { supabase } from '../../../lib/supabase';
 
-// Fungsi untuk membalas pesan via WaSenderAPI
 async function sendWhatsAppMessage(to: string, text: string) {
-    const url = 'https://wasenderapi.com/api/send-message'; // [cite: 139, 140, 141]
+    const url = 'https://www.wasenderapi.com/api/send-message';
     const token = process.env.WASENDER_BEARER_TOKEN;
 
-    await fetch(url, {
+    const res = await fetch(url, {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
-            'Authorization': `Bearer ${token}` // [cite: 52, 54]
+            'Authorization': `Bearer ${token}`
         },
-        body: JSON.stringify({
-            phone: to,
-            message: text
-        })
+        body: JSON.stringify({ to, text }) // <-- field yang benar: to & text
     });
+
+    if (!res.ok) {
+        console.error('Gagal kirim pesan:', await res.text());
+    }
 }
 
 export async function POST(request: Request) {
     try {
+        // Verifikasi webhook signature dulu
+        const signature = request.headers.get('x-webhook-signature');
+        if (signature !== process.env.WASENDER_WEBHOOK_SECRET) {
+            return NextResponse.json({ error: 'Invalid signature' }, { status: 401 });
+        }
+
         const body = await request.json();
 
-        // WaSenderAPI menggunakan field 'messageBody' untuk isi teks [cite: 37, 38]
-        const messageText = body.messageBody?.trim();
-        const senderNumber = body.from;
+        // Cuma proses event pesan masuk, abaikan event lain (session status, dll)
+        if (body.event !== 'messages.received') {
+            return NextResponse.json({ status: 'ignored', reason: 'Bukan event pesan' });
+        }
+
+        const msg = body.data?.messages;
+        const messageText: string | undefined = msg?.messageBody?.trim();
+        const senderNumber: string | undefined =
+            msg?.key?.cleanedSenderPn ?? msg?.key?.cleanedParticipantPn;
 
         if (!messageText || !senderNumber) {
             return NextResponse.json({ status: 'ignored', reason: 'Bukan pesan teks' });
@@ -33,7 +45,7 @@ export async function POST(request: Request) {
 
         const textLower = messageText.toLowerCase();
 
-        // SKENARIO 1: User ketik "HaloDesk" (Hanya merespons ini di awal)
+        // SKENARIO 1: User ketik "HaloDesk"
         if (textLower === 'halodesk') {
             const menu = `🤖 *Bot Helpdesk IT Undip*\n\nHalo! Selamat datang di Pusat Bantuan IT. Silakan balas dengan angka:\n*1.* 📝 Lapor Kendala\n*2.* 🔍 Cek Status\n\n_Ketik HaloDesk kapan saja untuk kembali._`;
             await sendWhatsAppMessage(senderNumber, menu);
@@ -47,26 +59,23 @@ export async function POST(request: Request) {
             return NextResponse.json({ status: 'success', action: 'instruction_sent' });
         }
 
-        // SKENARIO 3: User mengirim format laporan (mengandung tanda " - ")
+        // SKENARIO 3: Format laporan (mengandung " - ")
         if (textLower.includes(' - ')) {
             const parts = messageText.split(' - ');
 
             if (parts.length >= 3) {
                 const name = parts[0].trim();
                 const nim = parts[1].trim();
-                const complaint = parts.slice(2).join(' - ').trim(); // Gabungkan sisa teks jika keluhannya panjang
+                const complaint = parts.slice(2).join(' - ').trim();
 
-                // Simpan ke Supabase ke tabel wa_tickets yang tadi kita buat
                 const { error } = await supabase
                     .from('wa_tickets')
-                    .insert([
-                        {
-                            wa_number: senderNumber,
-                            reporter_name: name,
-                            reporter_nim: nim,
-                            description: complaint
-                        }
-                    ]);
+                    .insert([{
+                        wa_number: senderNumber,
+                        reporter_name: name,
+                        reporter_nim: nim,
+                        description: complaint
+                    }]);
 
                 if (error) {
                     console.error('Supabase Error:', error);
@@ -78,7 +87,6 @@ export async function POST(request: Request) {
             }
         }
 
-        // SKENARIO 4: Jika chat selain di atas, bot akan MENGABAIKANNYA (sesuai permintaan kamu)
         return NextResponse.json({ status: 'ignored', reason: 'Perintah tidak dikenali' });
 
     } catch (error) {
