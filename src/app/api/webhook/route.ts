@@ -101,8 +101,8 @@ export async function POST(request: Request) {
         }
 
         // 1. AMBIL DATA USER DAN SESSION
-        const { data: user } = await supabaseService.from('wa_users').select('*').eq('phone_number', senderNumber).single();
-        let { data: session } = await supabaseService.from('wa_sessions').select('*').eq('phone_number', senderNumber).single();
+        const { data: user } = await supabaseService.from('wa_users').select('*').eq('phone_number', senderNumber).maybeSingle();
+        let { data: session } = await supabaseService.from('wa_sessions').select('*').eq('phone_number', senderNumber).maybeSingle();
 
         // Jika tidak ada sesi, buat sesi IDLE baru
         if (!session) {
@@ -118,8 +118,8 @@ export async function POST(request: Request) {
             await supabaseService.from('wa_sessions').update({ step: 'AWAITING_ACTION', temp_data: {} }).eq('phone_number', senderNumber);
 
             const greeting = user
-                ? `🤖 Halo, selamat datang kembali, *${user.name}*!\n\nAda yang bisa dibantu hari ini?\n\n*1.* 📝 Buat Tiket Bantuan\n*2.* 🔍 Cek Status Tiket`
-                : `🤖 Halo! Selamat datang di Pusat Bantuan IT Undip.\n\nAda yang bisa kami bantu?\n\n*1.* 📝 Buat Tiket Bantuan\n*2.* 🔍 Cek Status Tiket`;
+                ? `🤖 Halo, selamat datang kembali, *${user.name}*!\n\nAda yang bisa dibantu hari ini?\n\n*1.* 📝 Buat Tiket Bantuan\n*2.* 🔍 Cek Status Tiket\n*3.* 📚 FAQ & Panduan IT`
+                : `🤖 Halo! Selamat datang di Pusat Bantuan IT Undip.\n\nAda yang bisa kami bantu?\n\n*1.* 📝 Buat Tiket Bantuan\n*2.* 🔍 Cek Status Tiket\n*3.* 📚 FAQ & Panduan IT`;
 
             await sendWhatsAppMessage(senderNumber, greeting);
             return NextResponse.json({ status: 'success' });
@@ -140,8 +140,35 @@ export async function POST(request: Request) {
                         await sendWhatsAppMessage(senderNumber, `Baik, mari buat tiket baru.\n\nSilakan balas dengan format:\n*NAMA - NIM*\n\nContoh: Budi - 21120124140146`);
                     }
                 } else if (textLower === '2') {
-                    await sendWhatsAppMessage(senderNumber, `Fitur cek status masih dikembangkan. Ketik *HaloDesk* untuk kembali ke menu.`);
+                    // FITUR 2: CEK STATUS TIKET TERAKHIR
+                    const { data: latestTicket } = await supabaseService
+                        .from('wa_tickets')
+                        .select('ticket_number, status, help_topic')
+                        .eq('wa_number', senderNumber)
+                        .order('created_at', { ascending: false })
+                        .limit(1)
+                        .single();
+
+                    if (latestTicket) {
+                        const statusIndo: Record<string, string> = {
+                            'open': 'Terkirim (Open)',
+                            'in_progress': 'Sedang Ditangani (In Progress)',
+                            'resolved': 'Menunggu Konfirmasi Selesai (Resolved)',
+                            'closed': 'Selesai (Closed)'
+                        };
+                        const statusTeks = statusIndo[latestTicket.status] || latestTicket.status;
+                        await sendWhatsAppMessage(senderNumber, `🔍 *Status Tiket Terakhirmu*\n\nNo Tiket: *#${latestTicket.ticket_number}*\nTopik: ${latestTicket.help_topic}\nStatus: *${statusTeks}*\n\nKetik *HaloDesk* untuk kembali ke menu utama.`);
+                    } else {
+                        await sendWhatsAppMessage(senderNumber, `Kamu belum memiliki tiket bantuan yang terdaftar di sistem kami.\n\nKetik *HaloDesk* untuk kembali ke menu utama.`);
+                    }
                     await supabaseService.from('wa_sessions').update({ step: 'IDLE' }).eq('phone_number', senderNumber);
+
+                } else if (textLower === '3') {
+                    // FITUR 3: MENU FAQ
+                    await supabaseService.from('wa_sessions').update({ step: 'AWAITING_FAQ_CHOICE' }).eq('phone_number', senderNumber);
+                    await sendWhatsAppMessage(senderNumber, `📚 *Panduan Mandiri IT Undip*\nSilakan pilih kategori kendala:\n\n*1.* 🔑 Lupa / Reset Password Akun SSO\n*2.* 🌐 Cara Login & Setting WiFi Undip\n*3.* 📧 Pembuatan & Kendala Email Kampus\n*4.* 🔙 Kembali ke Menu Utama`);
+                } else {
+                    await sendWhatsAppMessage(senderNumber, `Pilihan tidak valid. Silakan balas dengan angka 1, 2, atau 3.`);
                 }
                 break;
 
@@ -228,6 +255,27 @@ export async function POST(request: Request) {
                 await supabaseService.from('wa_sessions').update({ step: 'IDLE', temp_data: {} }).eq('phone_number', senderNumber);
 
                 await sendWhatsAppMessage(senderNumber, `✅ *Laporan Berhasil Diterima!*\n\nNomor Tiket: *#${ticketNumber}*\nTopik: ${topic}\nKendala: ${complaint}\n\n👨‍💻 _Silakan menunggu, Staff IT kami akan segera mengecek dan membalas pesan ini._`);
+                break;
+
+            case 'AWAITING_FAQ_CHOICE':
+                if (textLower === '1') {
+                    await sendWhatsAppMessage(senderNumber, `🔑 *Cara Reset Password Akun SSO*\n\n1. Buka halaman web *sso.undip.ac.id/reset*.\n2. Masukkan Username (NIP/NIM) dan Email Alternatif yang terdaftar.\n3. Cek kotak masuk (Inbox/Spam) email alternatifmu untuk mengklik link reset password.\n\n_Apakah panduan ini membantu? Ketik *HaloDesk* jika kamu masih butuh membuat tiket bantuan._`);
+                    await supabaseService.from('wa_sessions').update({ step: 'IDLE' }).eq('phone_number', senderNumber);
+                } else if (textLower === '2') {
+                    await sendWhatsAppMessage(senderNumber, `🌐 *Cara Login & Setting WiFi Undip*\n\n1. Hubungkan perangkatmu ke jaringan WiFi dengan nama *UNDIP*.\n2. Sistem akan otomatis membuka halaman Login.\n3. Masukkan Username: *NIM* dan Password: *Password SSO* kamu.\n4. Jika halaman login tidak muncul, ketik *1.1.1.1* di browser. Jika masih gagal, lupakan jaringan (Forget Network) dan coba lagi.\n\n_Ketik *HaloDesk* jika kamu masih butuh membuat tiket bantuan._`);
+                    await supabaseService.from('wa_sessions').update({ step: 'IDLE' }).eq('phone_number', senderNumber);
+                } else if (textLower === '3') {
+                    await sendWhatsAppMessage(senderNumber, `📧 *Pembuatan & Kendala Email Kampus*\n\n1. Email kampus otomatis terbuat saat registrasi awal (@students.undip.ac.id).\n2. Login melalui Gmail menggunakan alamat email tersebut.\n3. Password email biasanya sinkron dengan SSO. Jika gagal login, coba lakukan Reset Password SSO terlebih dahulu.\n\n_Ketik *HaloDesk* jika kamu masih butuh membuat tiket bantuan._`);
+                    await supabaseService.from('wa_sessions').update({ step: 'IDLE' }).eq('phone_number', senderNumber);
+                } else if (textLower === '4') {
+                    await supabaseService.from('wa_sessions').update({ step: 'AWAITING_ACTION' }).eq('phone_number', senderNumber);
+                    const backGreeting = user
+                        ? `🤖 Halo, ada yang bisa dibantu hari ini, *${user.name}*?\n\n*1.* 📝 Buat Tiket Bantuan\n*2.* 🔍 Cek Status Tiket\n*3.* 📚 FAQ & Panduan IT`
+                        : `🤖 Halo! Ada yang bisa kami bantu?\n\n*1.* 📝 Buat Tiket Bantuan\n*2.* 🔍 Cek Status Tiket\n*3.* 📚 FAQ & Panduan IT`;
+                    await sendWhatsAppMessage(senderNumber, backGreeting);
+                } else {
+                    await sendWhatsAppMessage(senderNumber, `Pilihan tidak valid. Silakan balas dengan angka 1 sampai 4.`);
+                }
                 break;
 
             default:
