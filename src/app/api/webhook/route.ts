@@ -111,6 +111,33 @@ export async function POST(request: Request) {
                 .insert([{ phone_number: senderNumber, step: 'IDLE', temp_data: {} }])
                 .select().single();
             session = newSession;
+        } else {
+            // ⏳ LAZY EVALUATION: PENGECEKAN SESSION TIMEOUT (15 MENIT)
+            // Jika status user sedang menggantung (bukan IDLE) dan ada data updated_at
+            if (session.step !== 'IDLE' && session.updated_at) {
+                const now = new Date();
+                const lastUpdate = new Date(session.updated_at);
+
+                // Hitung selisih waktu dalam menit
+                const diffInMinutes = (now.getTime() - lastUpdate.getTime()) / (1000 * 60);
+
+                if (diffInMinutes > 15) {
+                    // Reset sesi di database kembali ke awal
+                    await supabaseService
+                        .from('wa_sessions')
+                        .update({ step: 'IDLE', temp_data: {} })
+                        .eq('phone_number', senderNumber);
+
+                    // Beri notifikasi ramah ke mahasiswa
+                    await sendWhatsAppMessage(
+                        senderNumber,
+                        `⏳ *Sesi Berakhir*\n\nMaaf, sesi kamu telah di-reset karena tidak ada aktivitas selama lebih dari 15 menit.\n\nKetik *HaloDesk* untuk memulai kembali layanan Helpdesk.`
+                    );
+
+                    // Hentikan proses webhook sampai di sini (return early)
+                    return NextResponse.json({ status: 'success', action: 'session_timeout' });
+                }
+            }
         }
 
         // 2. JIKA USER KETIK "HALODESK" (RESET KE AWAL)
