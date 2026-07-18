@@ -1,65 +1,63 @@
 import { NextResponse } from 'next/server';
 import { supabaseService } from '@/src/lib/supabase/service';
 
-// Fungsi Kirim Pesan WA
+// --- UTILS ---
 async function sendWhatsAppMessage(to: string, text: string) {
     const url = 'https://www.wasenderapi.com/api/send-message';
     const token = process.env.WASENDER_BEARER_TOKEN;
-
-    const res = await fetch(url, {
+    await fetch(url, {
         method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${token}`,
-        },
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify({ to, text }),
-    });
-
-    if (!res.ok) console.error('Gagal kirim pesan:', await res.text());
+    }).catch(console.error);
 }
 
-// Upload base64 to Supabase Storage
 async function uploadMediaToSupabase(base64Data: string, mimeType: string, senderNumber: string): Promise<string | null> {
     try {
         const base64Content = base64Data.replace(/^data:([A-Za-z-+/]+);base64,/, '');
         const buffer = Buffer.from(base64Content, 'base64');
         const ext = mimeType.split('/')[1] || 'jpg';
         const fileName = `${senderNumber}-${Date.now()}.${ext}`;
-
-        const { data, error } = await supabaseService
-            .storage
-            .from('ticket-attachments')
-            .upload(fileName, buffer, {
-                contentType: mimeType,
-                upsert: true
-            });
-
-        if (error) {
-            console.error('Gagal upload media ke Supabase:', error);
-            return null;
-        }
-
-        const { data: publicUrlData } = supabaseService
-            .storage
-            .from('ticket-attachments')
-            .getPublicUrl(fileName);
-
-        return publicUrlData.publicUrl;
+        const { error } = await supabaseService.storage.from('ticket-attachments').upload(fileName, buffer, { contentType: mimeType, upsert: true });
+        if (error) return null;
+        return supabaseService.storage.from('ticket-attachments').getPublicUrl(fileName).data.publicUrl;
     } catch (e) {
-        console.error('Error handling base64 upload:', e);
         return null;
     }
 }
 
-// Daftar Topik Bantuan
-const TOPICS = [
-    "Infrastruktur & Jaringan Internet (WiFi)",
-    "Pelayanan IT / Akun SSO",
-    "Keamanan Siber",
-    "SISTER, BKD, atau Sinta",
-    "Lainnya"
-];
+async function getDecryptedMediaBase64(msgObject: any): Promise<string | null> {
+    const url = 'https://www.wasenderapi.com/api/decrypt-media';
+    const token = process.env.WASENDER_BEARER_TOKEN;
+    try {
+        const res = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+            body: JSON.stringify({ data: { messages: msgObject } }),
+        });
+        if (!res.ok) return null;
+        const json = await res.json();
+        if (!json.publicUrl || !json.publicUrl.startsWith('http')) return null;
+        const arrayBuffer = await (await fetch(json.publicUrl)).arrayBuffer();
+        const mimeType = msgObject.message?.imageMessage?.mimetype || 'image/jpeg';
+        return `data:${mimeType};base64,${Buffer.from(arrayBuffer).toString('base64')}`;
+    } catch {
+        return null;
+    }
+}
 
+// --- HELPER UNTUK MENDAPATKAN ATAU MEMBUAT KATEGORI ---
+async function getOrCreateCategory(categoryName: string): Promise<string | null> {
+    let { data: category } = await supabaseService.from('categories').select('id').eq('name', categoryName).limit(1).maybeSingle();
+    if (!category) {
+        const { data: newCat, error } = await supabaseService.from('categories').insert([{ name: categoryName, description: 'Auto-generated dari interaksi WA' }]).select('id').single();
+        if (error || !newCat) return null;
+        return newCat.id;
+    }
+    return category.id;
+}
+
+// --- WEBHOOK MAIN ROUTE ---
 export async function POST(request: Request) {
     try {
         const signature = request.headers.get('x-webhook-signature');
@@ -68,274 +66,374 @@ export async function POST(request: Request) {
         }
 
         const body = await request.json();
-        if (body.event !== 'messages.received') {
-            return NextResponse.json({ status: 'ignored' });
-        }
+        if (body.event !== 'messages.received') return NextResponse.json({ status: 'ignored' });
 
         const msg = body.data?.messages;
         const messageText = typeof msg?.messageBody === 'string' ? msg.messageBody.trim() : '';
         const senderNumber = msg?.key?.cleanedSenderPn ?? msg?.key?.cleanedParticipantPn;
 
-        if (!messageText || !senderNumber) {
-            return NextResponse.json({ status: 'ignored' });
-        }
-
+        if (!messageText || !senderNumber) return NextResponse.json({ status: 'ignored' });
         const textLower = messageText.toLowerCase();
 
-        // 0. INTERCEPT: JIKA USER KETIK "THANKSDESK" UNTUK CLOSING TIKET
-        if (textLower === 'thanksdesk') {
-            const { data: resolvedTicket } = await supabaseService
-                .from('wa_tickets')
-                .select('id')
-                .eq('wa_number', senderNumber)
-                .eq('status', 'resolved')
-                .order('resolved_at', { ascending: false })
-                .limit(1)
-                .single();
-
-            if (resolvedTicket) {
-                await supabaseService.from('wa_tickets').update({ status: 'closed' }).eq('id', resolvedTicket.id);
-                await sendWhatsAppMessage(senderNumber, "✅ Tiket Anda telah resmi ditutup. Terima kasih telah menghubungi Helpdesk IT Undip!");
-                return NextResponse.json({ status: 'success', action: 'ticket_closed' });
-            }
-        }
-
-        // 1. AMBIL DATA USER DAN SESSION
-        const { data: user } = await supabaseService.from('wa_users').select('*').eq('phone_number', senderNumber).maybeSingle();
+        // INIT USER & SESSION
+        let { data: user } = await supabaseService.from('users').select('*').eq('phone_number', senderNumber).maybeSingle();
         let { data: session } = await supabaseService.from('wa_sessions').select('*').eq('phone_number', senderNumber).maybeSingle();
 
-        // Jika tidak ada sesi, buat sesi IDLE baru
+        if (!user) {
+            await supabaseService.from('users').upsert({ phone_number: senderNumber, name: 'Pengguna WA', role: 'PELAPOR' }, { onConflict: 'phone_number' });
+        }
+
         if (!session) {
-            const { data: newSession } = await supabaseService
-                .from('wa_sessions')
-                .insert([{ phone_number: senderNumber, step: 'IDLE', temp_data: {} }])
-                .select().single();
+            const { data: newSession } = await supabaseService.from('wa_sessions').insert([{ phone_number: senderNumber, step: 'IDLE', temp_data: {} }]).select().single();
             session = newSession;
         } else {
-            // ⏳ LAZY EVALUATION: PENGECEKAN SESSION TIMEOUT (15 MENIT)
-            // Jika status user sedang menggantung (bukan IDLE) dan ada data updated_at
+            // Cek Timeout 15 Menit (Memastikan parse sebagai UTC dengan menambahkan Z)
             if (session.step !== 'IDLE' && session.updated_at) {
-                const now = new Date();
-                const lastUpdate = new Date(session.updated_at);
-
-                // Hitung selisih waktu dalam menit
-                const diffInMinutes = (now.getTime() - lastUpdate.getTime()) / (1000 * 60);
-
-                if (diffInMinutes > 15) {
-                    // Reset sesi di database kembali ke awal
-                    await supabaseService
-                        .from('wa_sessions')
-                        .update({ step: 'IDLE', temp_data: {} })
-                        .eq('phone_number', senderNumber);
-
-                    // Beri notifikasi ramah ke mahasiswa
-                    await sendWhatsAppMessage(
-                        senderNumber,
-                        `⏳ *Sesi Berakhir*\n\nMaaf, sesi kamu telah di-reset karena tidak ada aktivitas selama lebih dari 15 menit.\n\nKetik *HaloDesk* untuk memulai kembali layanan Helpdesk.`
-                    );
-
-                    // Hentikan proses webhook sampai di sini (return early)
-                    return NextResponse.json({ status: 'success', action: 'session_timeout' });
+                const safeDateStr = session.updated_at.endsWith('Z') ? session.updated_at : `${session.updated_at}Z`;
+                if ((new Date().getTime() - new Date(safeDateStr).getTime()) / 60000 > 15) {
+                    await supabaseService.from('wa_sessions').update({ step: 'IDLE', temp_data: {}, updated_at: new Date().toISOString() }).eq('phone_number', senderNumber);
+                    await sendWhatsAppMessage(senderNumber, `⏳ *Sesi Berakhir*\nMaaf, sesi telah di-reset karena tidak ada aktivitas selama lebih dari 15 menit.\nKetik *HaloDesk* untuk memulai kembali.`);
+                    return NextResponse.json({ status: 'success' });
                 }
             }
         }
 
-        // 2. JIKA USER KETIK "HALODESK" (RESET KE AWAL)
+        // RESET PERINTAH
         if (textLower === 'halodesk') {
-            await supabaseService.from('wa_sessions').update({ step: 'AWAITING_ACTION', temp_data: {} }).eq('phone_number', senderNumber);
-
-            const greeting = user
-                ? `🤖 Halo, selamat datang kembali, *${user.name}*!\n\nAda yang bisa dibantu hari ini?\n\n*1.* 📝 Buat Tiket Bantuan\n*2.* 🔍 Cek Status Tiket\n*3.* 📚 FAQ & Panduan IT`
-                : `🤖 Halo! Selamat datang di Pusat Bantuan IT Undip.\n\nAda yang bisa kami bantu?\n\n*1.* 📝 Buat Tiket Bantuan\n*2.* 🔍 Cek Status Tiket\n*3.* 📚 FAQ & Panduan IT`;
-
-            await sendWhatsAppMessage(senderNumber, greeting);
-            return NextResponse.json({ status: 'success' });
+            const nowIso = new Date().toISOString();
+            await supabaseService.from('wa_sessions').update({ step: 'IDLE', temp_data: {}, updated_at: nowIso }).eq('phone_number', senderNumber);
+            session.step = 'IDLE';
+            session.updated_at = nowIso;
         }
 
-        // 3. STATE MACHINE PERCAKAPAN
+        const updateState = async (step: string, appendData = {}) => {
+            const newTemp = { ...session.temp_data, ...appendData };
+            const nowIso = new Date().toISOString();
+            await supabaseService.from('wa_sessions').update({ step, temp_data: newTemp, updated_at: nowIso }).eq('phone_number', senderNumber);
+            session.temp_data = newTemp;
+            session.step = step;
+            session.updated_at = nowIso;
+        };
+
+        // --- STATE MACHINE ---
         switch (session.step) {
-
-            case 'AWAITING_ACTION':
+            case 'IDLE': {
                 if (textLower === '1') {
-                    if (user) {
-                        // Tanya apakah pakai data lama atau baru
-                        await supabaseService.from('wa_sessions').update({ step: 'CONFIRM_USER' }).eq('phone_number', senderNumber);
-                        await sendWhatsAppMessage(senderNumber, `Kamu akan membuat tiket. Gunakan data identitas atas nama *${user.name} (${user.nim})*?\n\n*1.* Ya, gunakan data saya\n*2.* Tidak, buat identitas baru`);
-                    } else {
-                        // User baru, langsung minta Nama - NIM
-                        await supabaseService.from('wa_sessions').update({ step: 'AWAITING_NAMA_NIM' }).eq('phone_number', senderNumber);
-                        await sendWhatsAppMessage(senderNumber, `Baik, mari buat tiket baru.\n\nSilakan balas dengan format:\n*NAMA - NIM*\n\nContoh: Budi - 21120124140146`);
-                    }
+                    await updateState('AWAITING_IDENTITY');
+                    await sendWhatsAppMessage(senderNumber, `📝 *Form Pembuatan Tiket*\nSilakan balas dengan identitas Anda menggunakan format:\n*Nama Lengkap - NIM/NIP - Unit Kerja*\n\nContoh: Budi - 211201 - FT\n\n_Balas 0 untuk kembali_`);
                 } else if (textLower === '2') {
-                    // FITUR 2: CEK STATUS TIKET TERAKHIR
-                    const { data: latestTicket } = await supabaseService
-                        .from('wa_tickets')
-                        .select('ticket_number, status, help_topic')
-                        .eq('wa_number', senderNumber)
-                        .order('created_at', { ascending: false })
-                        .limit(1)
-                        .single();
-
-                    if (latestTicket) {
-                        const statusIndo: Record<string, string> = {
-                            'open': 'Terkirim (Open)',
-                            'in_progress': 'Sedang Ditangani (In Progress)',
-                            'resolved': 'Menunggu Konfirmasi Selesai (Resolved)',
-                            'closed': 'Selesai (Closed)'
-                        };
-                        const statusTeks = statusIndo[latestTicket.status] || latestTicket.status;
-                        await sendWhatsAppMessage(senderNumber, `🔍 *Status Tiket Terakhirmu*\n\nNo Tiket: *#${latestTicket.ticket_number}*\nTopik: ${latestTicket.help_topic}\nStatus: *${statusTeks}*\n\nKetik *HaloDesk* untuk kembali ke menu utama.`);
-                    } else {
-                        await sendWhatsAppMessage(senderNumber, `Kamu belum memiliki tiket bantuan yang terdaftar di sistem kami.\n\nKetik *HaloDesk* untuk kembali ke menu utama.`);
-                    }
-                    await supabaseService.from('wa_sessions').update({ step: 'IDLE' }).eq('phone_number', senderNumber);
-
+                    await updateState('AWAITING_CEK_STATUS');
+                    await sendWhatsAppMessage(senderNumber, `🔍 *Cek Status Tiket*\nSilakan masukkan Nomor Tiket Anda.\n\nContoh: TKT-1234\n\n_Balas 0 untuk kembali_`);
                 } else if (textLower === '3') {
-                    // FITUR 3: MENU FAQ
-                    await supabaseService.from('wa_sessions').update({ step: 'AWAITING_FAQ_CHOICE' }).eq('phone_number', senderNumber);
-                    await sendWhatsAppMessage(senderNumber, `📚 *Panduan Mandiri IT Undip*\nSilakan pilih kategori kendala:\n\n*1.* 🔑 Lupa / Reset Password Akun SSO\n*2.* 🌐 Cara Login & Setting WiFi Undip\n*3.* 📧 Pembuatan & Kendala Email Kampus\n*4.* 🔙 Kembali ke Menu Utama`);
-                } else {
-                    await sendWhatsAppMessage(senderNumber, `Pilihan tidak valid. Silakan balas dengan angka 1, 2, atau 3.`);
-                }
-                break;
-
-            case 'CONFIRM_USER':
-                if (textLower === '1') {
-                    // Lanjut ke Pilih Topik dengan data lama
-                    const tempData = { name: user.name, nim: user.nim };
-                    await supabaseService.from('wa_sessions').update({ step: 'AWAITING_TOPIC', temp_data: tempData }).eq('phone_number', senderNumber);
-                    await sendWhatsAppMessage(senderNumber, `Baik. Silakan pilih *Kategori Topik Bantuan* dengan membalas angkanya:\n\n1. 🌐 Jaringan Internet (WiFi)\n2. 🔑 Pelayanan IT / SSO\n3. 🛡️ Keamanan Siber\n4. 📚 SISTER / BKD / Sinta\n5. ❓ Lainnya`);
-                } else if (textLower === '2') {
-                    // Minta data baru
-                    await supabaseService.from('wa_sessions').update({ step: 'AWAITING_NAMA_NIM' }).eq('phone_number', senderNumber);
-                    await sendWhatsAppMessage(senderNumber, `Silakan balas dengan identitas baru berformat:\n*NAMA - NIM*\n\nContoh: Reka - 21120124140146`);
-                }
-                break;
-
-            case 'AWAITING_NAMA_NIM':
-                if (messageText.includes('-')) {
-                    const parts = messageText.split('-');
-                    if (parts.length >= 2) {
-                        const name = parts[0].trim();
-                        const nim = parts[1].trim();
-
-                        await supabaseService.from('wa_sessions').update({
-                            step: 'AWAITING_TOPIC',
-                            temp_data: { name, nim }
-                        }).eq('phone_number', senderNumber);
-
-                        await sendWhatsAppMessage(senderNumber, `Halo ${name}. Silakan pilih *Kategori Topik Bantuan* dengan membalas angkanya:\n\n1. 🌐 Jaringan Internet (WiFi)\n2. 🔑 Pelayanan IT / SSO\n3. 🛡️ Keamanan Siber\n4. 📚 SISTER / BKD / Sinta\n5. ❓ Lainnya`);
-                    } else {
-                        await sendWhatsAppMessage(senderNumber, `Format salah. Harap gunakan tanda strip. Contoh: Budi - 21120124`);
-                    }
-                } else {
-                    await sendWhatsAppMessage(senderNumber, `Harap ketik dengan format: NAMA - NIM`);
-                }
-                break;
-
-            case 'AWAITING_TOPIC':
-                const topicIndex = parseInt(textLower) - 1;
-                if (topicIndex >= 0 && topicIndex < TOPICS.length) {
-                    const selectedTopic = TOPICS[topicIndex];
-                    const newData = { ...session.temp_data, topic: selectedTopic };
-
-                    await supabaseService.from('wa_sessions').update({
-                        step: 'AWAITING_COMPLAINT',
-                        temp_data: newData
-                    }).eq('phone_number', senderNumber);
-
-                    await sendWhatsAppMessage(senderNumber, `Topik: *${selectedTopic}*.\n\nSilakan ketikkan detail kendala yang kamu alami secara lengkap. (Kamu juga bisa melampirkan screenshot).`);
-                } else {
-                    await sendWhatsAppMessage(senderNumber, `Pilihan tidak valid. Silakan balas dengan angka 1 sampai 5.`);
-                }
-                break;
-
-            case 'AWAITING_COMPLAINT':
-                const complaint = messageText || '(Ada Lampiran)';
-                const { name, nim, topic } = session.temp_data;
-                const ticketNumber = `TKT-${Math.floor(1000 + Math.random() * 9000)}`; // Generate random ticket ID
-
-                // Handle media upload
-                let attachmentUrl = null;
-                const mediaBase64 = msg?.mediaBase64 || body.data?.mediaBase64;
-                if (mediaBase64) {
-                    const mimeType = msg?.mimetype || 'image/jpeg';
-                    attachmentUrl = await uploadMediaToSupabase(mediaBase64, mimeType, senderNumber);
-                }
-
-                // 1. Simpan/Update user profile
-                await supabaseService.from('wa_users').upsert({ phone_number: senderNumber, name, nim });
-
-                // 2. Simpan tiket
-                await supabaseService.from('wa_tickets').insert([{
-                    wa_number: senderNumber,
-                    reporter_name: name,
-                    reporter_nim: nim,
-                    help_topic: topic,
-                    description: complaint,
-                    ticket_number: ticketNumber,
-                    status: 'open',
-                    attachment_url: attachmentUrl
-                }]);
-
-                // 3. Reset Session ke IDLE
-                await supabaseService.from('wa_sessions').update({ step: 'IDLE', temp_data: {} }).eq('phone_number', senderNumber);
-
-                await sendWhatsAppMessage(senderNumber, `✅ *Laporan Berhasil Diterima!*\n\nNomor Tiket: *#${ticketNumber}*\nTopik: ${topic}\nKendala: ${complaint}\n\n👨‍💻 _Silakan menunggu, Staff IT kami akan segera mengecek dan membalas pesan ini._`);
-                break;
-
-            case 'AWAITING_FAQ_CHOICE':
-                if (textLower === '1') {
-                    await sendWhatsAppMessage(senderNumber, `🔑 *Cara Reset Password Akun SSO*\n\n1. Buka halaman web *sso.undip.ac.id/reset*.\n2. Masukkan Username (NIP/NIM) dan Email Alternatif yang terdaftar.\n3. Cek kotak masuk (Inbox/Spam) email alternatifmu untuk mengklik link reset password.\n\n_Apakah panduan ini membantu? Ketik *HaloDesk* jika kamu masih butuh membuat tiket bantuan._`);
-                    await supabaseService.from('wa_sessions').update({ step: 'IDLE' }).eq('phone_number', senderNumber);
-                } else if (textLower === '2') {
-                    await sendWhatsAppMessage(senderNumber, `🌐 *Cara Login & Setting WiFi Undip*\n\n1. Hubungkan perangkatmu ke jaringan WiFi dengan nama *UNDIP*.\n2. Sistem akan otomatis membuka halaman Login.\n3. Masukkan Username: *NIM* dan Password: *Password SSO* kamu.\n4. Jika halaman login tidak muncul, ketik *1.1.1.1* di browser. Jika masih gagal, lupakan jaringan (Forget Network) dan coba lagi.\n\n_Ketik *HaloDesk* jika kamu masih butuh membuat tiket bantuan._`);
-                    await supabaseService.from('wa_sessions').update({ step: 'IDLE' }).eq('phone_number', senderNumber);
-                } else if (textLower === '3') {
-                    await sendWhatsAppMessage(senderNumber, `📧 *Pembuatan & Kendala Email Kampus*\n\n1. Email kampus otomatis terbuat saat registrasi awal (@students.undip.ac.id).\n2. Login melalui Gmail menggunakan alamat email tersebut.\n3. Password email biasanya sinkron dengan SSO. Jika gagal login, coba lakukan Reset Password SSO terlebih dahulu.\n\n_Ketik *HaloDesk* jika kamu masih butuh membuat tiket bantuan._`);
-                    await supabaseService.from('wa_sessions').update({ step: 'IDLE' }).eq('phone_number', senderNumber);
+                    await updateState('AWAITING_TAMBAH_INFO_NO');
+                    await sendWhatsAppMessage(senderNumber, `➕ *Tambah Informasi Tiket*\nMasukkan Nomor Tiket yang ingin Anda tambahkan infonya.\n\nContoh: TKT-1234\n\n_Balas 0 untuk kembali_`);
                 } else if (textLower === '4') {
-                    await supabaseService.from('wa_sessions').update({ step: 'AWAITING_ACTION' }).eq('phone_number', senderNumber);
-                    const backGreeting = user
-                        ? `🤖 Halo, ada yang bisa dibantu hari ini, *${user.name}*?\n\n*1.* 📝 Buat Tiket Bantuan\n*2.* 🔍 Cek Status Tiket\n*3.* 📚 FAQ & Panduan IT`
-                        : `🤖 Halo! Ada yang bisa kami bantu?\n\n*1.* 📝 Buat Tiket Bantuan\n*2.* 🔍 Cek Status Tiket\n*3.* 📚 FAQ & Panduan IT`;
-                    await sendWhatsAppMessage(senderNumber, backGreeting);
+                    await updateState('AWAITING_FAQ_L1');
+                    await sendWhatsAppMessage(senderNumber, `💡 *FAQ & Panduan*\nPilih topik:\n1. Aplikasi\n2. Website & Email\n3. Jaringan & Internet\n4. Cyber Security\n\n0. Kembali`);
+                } else if (textLower === '5') {
+                    await sendWhatsAppMessage(senderNumber, `📞 *Hubungi Petugas*\nLokasi: Gedung DSTI Universitas Diponegoro\nJam Operasional: Senin - Jumat (08.00 - 16.00)\nTelepon: (024) 1234567\n\n_Ketik HaloDesk untuk menu utama._`);
+                } else if (textLower === '6') {
+                    await updateState('AWAITING_SURVEY_RATING');
+                    await sendWhatsAppMessage(senderNumber, `📊 *Survei Kepuasan*\nBerapa bintang yang Anda berikan untuk layanan kami? (1-5)\n\n1 = Sangat Buruk\n5 = Sangat Baik\n\n0. Kembali`);
+                } else if (textLower === '0') {
+                    await sendWhatsAppMessage(senderNumber, `👋 Terima kasih telah menghubungi Helpdesk IT UNDIP. Sesi diakhiri.`);
                 } else {
-                    await sendWhatsAppMessage(senderNumber, `Pilihan tidak valid. Silakan balas dengan angka 1 sampai 4.`);
+                    await sendWhatsAppMessage(senderNumber, `🤖 *Halo! Pusat Bantuan IT Universitas Diponegoro.*\nSilakan balas dengan *angka*:\n*1.* 📝 Buat Tiket\n*2.* 🔍 Cek Status\n*3.* ➕ Tambah Info\n*4.* 📚 FAQ & Panduan\n*5.* 📞 Hubungi Petugas\n*6.* 📊 Survei\n*0.* ❌ Akhiri\n\n⚠️ Jangan pernah mengirimkan Password / OTP!`);
                 }
                 break;
+            }
+
+            // --- ALUR 1: BUAT TIKET ---
+            case 'AWAITING_IDENTITY': {
+                if (textLower === '0') {
+                    await updateState('IDLE');
+                    await sendWhatsAppMessage(senderNumber, `Kembali ke Menu Utama. Ketik HaloDesk.`);
+                    break;
+                }
+                const parts = messageText.split('-').map((s: string) => s.trim());
+                if (parts.length < 3) {
+                    await sendWhatsAppMessage(senderNumber, `⚠️ Format salah. Harus ada tanda strip (-).\nContoh: Budi - 211201 - FT\n0. Kembali`);
+                    break;
+                }
+                await updateState('AWAITING_CAT_L1', { name: parts[0], nim: parts[1], faculty: parts[2] });
+                await sendWhatsAppMessage(senderNumber, `📌 *Kategori Layanan (Level 1)*\n1. Aplikasi\n2. Website dan Email\n3. Jaringan dan Internet\n4. Cyber Security\n0. Kembali`);
+                break;
+            }
+            case 'AWAITING_CAT_L1': {
+                if (textLower === '0') {
+                    await updateState('IDLE');
+                    await sendWhatsAppMessage(senderNumber, `Kembali ke Menu Utama. Ketik HaloDesk.`);
+                    break;
+                }
+                if (textLower === '1') {
+                    await updateState('AWAITING_CAT_L2_APP');
+                    await sendWhatsAppMessage(senderNumber, `📂 *Aplikasi*\n1. SSO\n2. Gentayu\n3. Mandala\n4. E-Office\n5. Lainnya\n0. Kembali`);
+                } else if (textLower === '2') {
+                    await updateState('AWAITING_CAT_L2_WEB');
+                    await sendWhatsAppMessage(senderNumber, `📂 *Website dan Email*\n1. Domain\n2. Website\n3. Email\n4. Lisensi\n0. Kembali`);
+                } else if (textLower === '3') {
+                    await updateState('AWAITING_CAT_L2_NET');
+                    await sendWhatsAppMessage(senderNumber, `📂 *Jaringan dan Internet*\n1. WiFi\n2. VPN\n3. VM\n0. Kembali`);
+                } else if (textLower === '4') {
+                    await updateState('AWAITING_CAT_L2_SEC');
+                    await sendWhatsAppMessage(senderNumber, `📂 *Cyber dan Security*\n1. Backdoor\n2. Keamanan Sistem\n0. Kembali`);
+                } else {
+                    await sendWhatsAppMessage(senderNumber, `⚠️ Pilihan tidak valid.`);
+                }
+                break;
+            }
+            case 'AWAITING_CAT_L2_APP': {
+                if (textLower === '0') {
+                    await updateState('AWAITING_CAT_L1');
+                    await sendWhatsAppMessage(senderNumber, `📌 *Kategori Layanan (Level 1)*\n1. Aplikasi\n2. Website dan Email\n3. Jaringan dan Internet\n4. Cyber Security\n0. Kembali`);
+                } else if (textLower === '1') {
+                    await updateState('AWAITING_CAT_L3_SSO');
+                    await sendWhatsAppMessage(senderNumber, `📂 *Aplikasi > SSO*\n1. Pembuatan Akun\n2. Reset Akun\n3. Perubahan Profil\n4. Reset OTP\n5. SIAP\n0. Kembali`);
+                } else if (textLower === '2') {
+                    await updateState('AWAITING_CAT_L3_GENTAYU');
+                    await sendWhatsAppMessage(senderNumber, `📂 *Aplikasi > Gentayu*\n1. Gentayu Pegawai\n2. Gentayu Mahasiswa\n0. Kembali`);
+                } else if (['3','4','5'].includes(textLower)) {
+                    const topic = textLower === '3' ? 'Aplikasi - Mandala' : textLower === '4' ? 'Aplikasi - E-Office' : 'Aplikasi - Lainnya';
+                    await updateState('AWAITING_COMPLAINT', { topic });
+                    await sendWhatsAppMessage(senderNumber, `✍️ *Tulis Kendala Anda*\nAnda memilih: ${topic}\nSilakan ketik detail keluhan atau kirimkan screenshot.\n⚠️ Dilarang mengirim Password/OTP!`);
+                } else {
+                    await sendWhatsAppMessage(senderNumber, `⚠️ Pilihan tidak valid.`);
+                }
+                break;
+            }
+            case 'AWAITING_CAT_L3_SSO': {
+                if (textLower === '0') {
+                    await updateState('AWAITING_CAT_L2_APP');
+                    await sendWhatsAppMessage(senderNumber, `📂 *Aplikasi*\n1. SSO\n2. Gentayu\n3. Mandala\n4. E-Office\n5. Lainnya\n0. Kembali`);
+                } else if (textLower === '5') {
+                    await updateState('AWAITING_CAT_L4_SIAP');
+                    await sendWhatsAppMessage(senderNumber, `📂 *Aplikasi > SSO > SIAP*\n1. Perubahan Profil SIAP\n2. Perubahan Alamat SIAP\n0. Kembali`);
+                } else if (['1','2','3','4'].includes(textLower)) {
+                    const topics: any = { '1': 'Pembuatan Akun SSO', '2': 'Reset Akun SSO', '3': 'Perubahan Profil SSO', '4': 'Reset OTP' };
+                    await updateState('AWAITING_COMPLAINT', { topic: `Aplikasi - SSO - ${topics[textLower]}` });
+                    await sendWhatsAppMessage(senderNumber, `✍️ *Tulis Kendala Anda*\nSilakan ketik detail keluhan atau kirimkan screenshot.\n⚠️ Dilarang mengirim Password/OTP!`);
+                } else {
+                    await sendWhatsAppMessage(senderNumber, `⚠️ Pilihan tidak valid.`);
+                }
+                break;
+            }
+            case 'AWAITING_CAT_L4_SIAP': {
+                if (textLower === '0') {
+                    await updateState('AWAITING_CAT_L3_SSO');
+                    await sendWhatsAppMessage(senderNumber, `📂 *Aplikasi > SSO*\n1. Pembuatan Akun\n2. Reset Akun\n3. Perubahan Profil\n4. Reset OTP\n5. SIAP\n0. Kembali`);
+                } else if (['1','2'].includes(textLower)) {
+                    const topic = textLower === '1' ? 'Aplikasi - SSO - SIAP - Perubahan Profil' : 'Aplikasi - SSO - SIAP - Perubahan Alamat';
+                    await updateState('AWAITING_COMPLAINT', { topic });
+                    await sendWhatsAppMessage(senderNumber, `✍️ *Tulis Kendala Anda*\nSilakan ketik detail keluhan atau kirimkan screenshot.\n⚠️ Dilarang mengirim Password/OTP!`);
+                } else {
+                    await sendWhatsAppMessage(senderNumber, `⚠️ Pilihan tidak valid.`);
+                }
+                break;
+            }
+            case 'AWAITING_CAT_L3_GENTAYU':
+            case 'AWAITING_CAT_L2_WEB':
+            case 'AWAITING_CAT_L2_NET':
+            case 'AWAITING_CAT_L2_SEC': {
+                if (textLower === '0') {
+                    await updateState('AWAITING_CAT_L1'); // Simplified back
+                    await sendWhatsAppMessage(senderNumber, `📌 *Kategori Layanan (Level 1)*\n1. Aplikasi\n2. Website dan Email\n3. Jaringan dan Internet\n4. Cyber Security\n0. Kembali`);
+                } else {
+                    // For the sake of this prototype logic, any valid number input captures a generic topic
+                    let categoryMap: any = {
+                        'AWAITING_CAT_L3_GENTAYU': { '1': 'Gentayu Pegawai', '2': 'Gentayu Mahasiswa' },
+                        'AWAITING_CAT_L2_WEB': { '1': 'Domain', '2': 'Website', '3': 'Email', '4': 'Lisensi' },
+                        'AWAITING_CAT_L2_NET': { '1': 'WiFi', '2': 'VPN', '3': 'VM' },
+                        'AWAITING_CAT_L2_SEC': { '1': 'Backdoor', '2': 'Keamanan Sistem' },
+                    };
+                    const selected = categoryMap[session.step][textLower];
+                    if (selected) {
+                        await updateState('AWAITING_COMPLAINT', { topic: selected });
+                        await sendWhatsAppMessage(senderNumber, `✍️ *Tulis Kendala Anda*\nAnda memilih: ${selected}\nSilakan ketik detail keluhan atau kirimkan screenshot.\n⚠️ Dilarang mengirim Password/OTP!`);
+                    } else {
+                        await sendWhatsAppMessage(senderNumber, `⚠️ Pilihan tidak valid.`);
+                    }
+                }
+                break;
+            }
+
+            case 'AWAITING_COMPLAINT': {
+                if (textLower === '0') {
+                    await updateState('IDLE');
+                    await sendWhatsAppMessage(senderNumber, `Kembali ke Menu Utama. Ketik HaloDesk.`);
+                    break;
+                }
+                if (textLower.includes('password') || textLower.includes('otp') || textLower.includes('sandi')) {
+                    await sendWhatsAppMessage(senderNumber, `🚨 *PERINGATAN KEAMANAN (SEC-07)*\nSistem mendeteksi adanya indikasi pengiriman password/OTP. Mohon ulangi penjelasan Anda TANPA menyertakan data sensitif tersebut!`);
+                    break;
+                }
+
+                const fullText = messageText || '(Ada Lampiran)';
+                let complaintSubject = 'Tanpa Subjek';
+                let complaintDesc = fullText;
+
+                // Split by newline to get subject and description
+                if (fullText.includes('\n')) {
+                    const lines = fullText.split('\n');
+                    complaintSubject = lines[0].trim();
+                    complaintDesc = lines.slice(1).join('\n').trim() || '(Tidak ada detail tambahan)';
+                } else {
+                    complaintSubject = fullText;
+                }
+
+                let uploadedAttachmentUrl = null;
+                const imageMsg = msg?.message?.imageMessage;
+
+                if (imageMsg) {
+                    const mimeType = imageMsg.mimetype || 'image/jpeg';
+                    const hdBase64 = await getDecryptedMediaBase64(msg);
+                    if (hdBase64) uploadedAttachmentUrl = await uploadMediaToSupabase(hdBase64, mimeType, senderNumber);
+                    else if (imageMsg.jpegThumbnail) uploadedAttachmentUrl = await uploadMediaToSupabase(imageMsg.jpegThumbnail, mimeType, senderNumber);
+                }
+
+                await updateState('AWAITING_CONFIRMATION', { subject: complaintSubject, complaint: complaintDesc, attachmentUrl: uploadedAttachmentUrl });
+                const { name, nim, faculty, topic } = session.temp_data;
+                await sendWhatsAppMessage(senderNumber, `📋 *RINGKASAN TIKET*\n👤 Nama: ${name}\n🏢 Unit: ${faculty}\n📌 Kategori: ${topic}\n🏷️ Subjek: ${complaintSubject}\n📝 Keluhan: ${complaintDesc}\n📎 Lampiran: ${uploadedAttachmentUrl ? 'Tersimpan' : '-'}\n\n1. KIRIM\n2. BATAL`);
+                break;
+            }
+
+            case 'AWAITING_CONFIRMATION': {
+                if (textLower === '1') {
+                    const { name, nim, faculty, topic, subject, complaint, attachmentUrl } = session.temp_data;
+                    const ticketNumber = `TKT-${Math.floor(1000 + Math.random() * 9000)}`;
+
+                    const { data: savedUser } = await supabaseService.from('users').upsert({
+                        phone_number: senderNumber, name, identity_number: nim, faculty_unit: faculty, role: 'PELAPOR'
+                    }, { onConflict: 'phone_number' }).select().single();
+
+                    const categoryId = await getOrCreateCategory(topic);
+
+                    const { error } = await supabaseService.from('tickets').insert([{
+                        ticket_number: ticketNumber,
+                        reporter_id: savedUser?.id,
+                        category_id: categoryId,
+                        subject: subject,
+                        description: complaint,
+                        attachment_url: attachmentUrl,
+                        status: 'Open'
+                    }]);
+
+                    if (error) {
+                        await sendWhatsAppMessage(senderNumber, `❌ Gagal menyimpan tiket.`);
+                    } else {
+                        await updateState('IDLE');
+                        await sendWhatsAppMessage(senderNumber, `✅ *Tiket Berhasil Dibuat!*\nNomor Tiket Anda: *${ticketNumber}*\n\nTim Helpdesk akan segera memverifikasi laporan Anda. Gunakan menu 2 untuk mengecek status.`);
+                    }
+                } else if (textLower === '2' || textLower === '0') {
+                    await updateState('IDLE');
+                    await sendWhatsAppMessage(senderNumber, `❌ Pembuatan tiket dibatalkan. Ketik *HaloDesk* untuk menu utama.`);
+                }
+                break;
+            }
+
+            // --- ALUR 2: CEK STATUS ---
+            case 'AWAITING_CEK_STATUS': {
+                if (textLower === '0') {
+                    await updateState('IDLE');
+                    await sendWhatsAppMessage(senderNumber, `Kembali ke Menu Utama. Ketik HaloDesk.`);
+                    break;
+                }
+                const ticketNum = messageText.toUpperCase();
+                const { data: ticket } = await supabaseService.from('tickets').select('*, categories(name), users!tickets_technician_id_fkey(name)').eq('ticket_number', ticketNum).maybeSingle();
+                
+                if (ticket) {
+                    const techName = ticket.users?.name || 'Belum ditugaskan';
+                    await sendWhatsAppMessage(senderNumber, `🔍 *Status Tiket: ${ticketNum}*\nStatus: *${ticket.status}*\nPrioritas: ${ticket.priority || '-'}\nKategori: ${ticket.categories?.name || '-'}\nTeknisi: ${techName}\nDiupdate: ${new Date(ticket.resolved_at || ticket.created_at).toLocaleString('id-ID')}\n\n0. Kembali`);
+                } else {
+                    await sendWhatsAppMessage(senderNumber, `⚠️ Tiket tidak ditemukan. Pastikan format benar (contoh: TKT-1234).\n0. Kembali`);
+                }
+                break;
+            }
+
+            // --- ALUR 3: TAMBAH INFO ---
+            case 'AWAITING_TAMBAH_INFO_NO': {
+                if (textLower === '0') {
+                    await updateState('IDLE');
+                    await sendWhatsAppMessage(senderNumber, `Kembali ke Menu Utama. Ketik HaloDesk.`);
+                    break;
+                }
+                const ticketNum = messageText.toUpperCase();
+                const { data: ticket } = await supabaseService.from('tickets').select('id, status').eq('ticket_number', ticketNum).maybeSingle();
+                if (!ticket) {
+                    await sendWhatsAppMessage(senderNumber, `⚠️ Tiket tidak ditemukan.\n0. Kembali`);
+                } else if (ticket.status === 'Selesai/Close') {
+                    await sendWhatsAppMessage(senderNumber, `⚠️ Tiket ini sudah ditutup dan tidak dapat ditambah informasinya.\n0. Kembali`);
+                } else {
+                    await updateState('AWAITING_TAMBAH_INFO_MSG', { ticket_id: ticket.id, ticketNum });
+                    await sendWhatsAppMessage(senderNumber, `➕ *Tiket Ditemukan*\nSilakan kirimkan informasi tambahan atau lampiran untuk tiket *${ticketNum}*.\n0. Batal`);
+                }
+                break;
+            }
+            case 'AWAITING_TAMBAH_INFO_MSG': {
+                if (textLower === '0') {
+                    await updateState('IDLE');
+                    await sendWhatsAppMessage(senderNumber, `Batal tambah info.`);
+                    break;
+                }
+                const { ticket_id, ticketNum } = session.temp_data;
+                const appendText = `\n\n[INFO TAMBAHAN]: ${messageText}`;
+                
+                // Coba gunakan RPC jika ada
+                const { error: rpcError } = await supabaseService.rpc('append_ticket_description', { t_id: ticket_id, add_text: appendText });
+                
+                // Fallback manual jika RPC gagal/tidak ditemukan
+                if (rpcError) {
+                    const { data: oldT } = await supabaseService.from('tickets').select('description').eq('id', ticket_id).maybeSingle();
+                    if (oldT) {
+                        await supabaseService.from('tickets').update({ description: (oldT.description || '') + appendText }).eq('id', ticket_id);
+                    }
+                }
+                
+                await updateState('IDLE');
+                await sendWhatsAppMessage(senderNumber, `✅ Informasi berhasil ditambahkan ke tiket *${ticketNum}*. Operator/Teknisi akan segera mengeceknya.`);
+                break;
+            }
+
+            // --- ALUR 4: FAQ ---
+            case 'AWAITING_FAQ_L1': {
+                if (textLower === '0') {
+                    await updateState('IDLE');
+                    await sendWhatsAppMessage(senderNumber, `Kembali ke Menu Utama.`);
+                } else if (['1','2','3','4'].includes(textLower)) {
+                    await updateState('IDLE');
+                    await sendWhatsAppMessage(senderNumber, `📚 *Panduan Anda*\nSilakan kunjungi portal panduan kami di:\nhttps://helpdesk.undip.ac.id/faq\n\nKetik HaloDesk untuk kembali.`);
+                } else {
+                    await sendWhatsAppMessage(senderNumber, `⚠️ Pilihan tidak valid.`);
+                }
+                break;
+            }
+
+            // --- ALUR 6: SURVEI ---
+            case 'AWAITING_SURVEY_RATING': {
+                if (textLower === '0') {
+                    await updateState('IDLE');
+                    await sendWhatsAppMessage(senderNumber, `Kembali ke Menu Utama.`);
+                } else if (['1','2','3','4','5'].includes(textLower)) {
+                    await updateState('AWAITING_SURVEY_SARAN', { rating: textLower });
+                    await sendWhatsAppMessage(senderNumber, `Terima kasih! Anda memberi rating ⭐ ${textLower}.\nSilakan ketik saran/masukan Anda untuk layanan kami.\n0. Lewati`);
+                } else {
+                    await sendWhatsAppMessage(senderNumber, `⚠️ Masukkan angka 1 sampai 5.`);
+                }
+                break;
+            }
+            case 'AWAITING_SURVEY_SARAN': {
+                await updateState('IDLE');
+                await sendWhatsAppMessage(senderNumber, `✅ *Terima kasih!* Survei Anda telah disimpan. Masukan Anda sangat berarti bagi peningkatan layanan kami.\n\nKetik HaloDesk untuk kembali.`);
+                break;
+            }
 
             default:
-                // Cek apakah user punya tiket aktif (in_progress atau resolved)
-                const { data: activeTicket } = await supabaseService
-                    .from('wa_tickets')
-                    .select('id, status')
-                    .eq('wa_number', senderNumber)
-                    .in('status', ['in_progress', 'resolved'])
-                    .order('created_at', { ascending: false })
-                    .limit(1)
-                    .maybeSingle();
-
-                if (activeTicket) {
-                    if (activeTicket.status === 'resolved') {
-                        // User membalas saat status resolved tapi bukan thanksdesk -> Reopen tiket
-                        await supabaseService.from('wa_tickets').update({ status: 'in_progress' }).eq('id', activeTicket.id);
-                        await sendWhatsAppMessage(senderNumber, `🔄 *Tiket Dibuka Kembali*\n\nPesan Anda telah kami terima. Tim Helpdesk IT akan segera mengeceknya kembali.`);
-                        return NextResponse.json({ status: 'success', action: 'ticket_reopened' });
-                    } else if (activeTicket.status === 'in_progress') {
-                        // User sedang chat dengan admin, bot diam saja
-                        return NextResponse.json({ status: 'ignored', reason: 'chat_with_admin' });
-                    }
-                }
-
-                await sendWhatsAppMessage(senderNumber, `Ketik *HaloDesk* untuk memulai layanan Helpdesk IT Undip.`);
+                await sendWhatsAppMessage(senderNumber, `⚠️ Sesi tidak valid. Ketik *HaloDesk* untuk reset.`);
                 break;
         }
 
         return NextResponse.json({ status: 'success' });
-
-    } catch (error) {
+    } catch (error: any) {
         console.error('Webhook Error:', error);
-        return NextResponse.json({ error: 'Internal Server Error' }, { status: 500 });
+        return NextResponse.json({ error: error.message }, { status: 500 });
     }
 }

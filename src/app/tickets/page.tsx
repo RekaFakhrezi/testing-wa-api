@@ -1,8 +1,8 @@
 import { redirect } from 'next/navigation';
 import { createClient } from '../../lib/supabase/server';
-import AssignButton from '../components/AssignButton';
-import LogoutButton from '../components/LogoutButton';
-import ResolveButton from '../components/ResolveButton';
+import AssignButton from '../../components/AssignButton';
+import LogoutButton from '../../components/LogoutButton';
+import ResolveButton from '../../components/ResolveButton';
 import Link from 'next/link';
 
 export const dynamic = 'force-dynamic';
@@ -159,8 +159,8 @@ export default async function TicketsPage(props: { searchParams: Promise<{ tab?:
                         key={tab.id}
                         href={`?tab=${tab.id}`}
                         className={`px-4 py-2 text-sm font-medium rounded-t-lg transition-colors whitespace-nowrap ${currentTab === tab.id
-                                ? 'bg-gray-800 text-white'
-                                : 'text-gray-400 hover:text-gray-200 hover:bg-gray-800/50'
+                            ? 'bg-gray-800 text-white'
+                            : 'text-gray-400 hover:text-gray-200 hover:bg-gray-800/50'
                             }`}
                     >
                         {tab.label}
@@ -201,7 +201,7 @@ export default async function TicketsPage(props: { searchParams: Promise<{ tab?:
                                         }
                                     )}
                                 </td>
-                                
+
                                 <td className="px-4 py-3 font-mono text-xs">
                                     {ticket.ticket_number || '-'}
                                 </td>
@@ -217,7 +217,7 @@ export default async function TicketsPage(props: { searchParams: Promise<{ tab?:
                                 <td className="px-4 py-3">
                                     {ticket.wa_number}
                                 </td>
-                                
+
                                 <td className="px-4 py-3 text-xs">
                                     {ticket.help_topic || '-'}
                                 </td>
@@ -228,7 +228,7 @@ export default async function TicketsPage(props: { searchParams: Promise<{ tab?:
                                 >
                                     {ticket.description}
                                 </td>
-                                
+
                                 <td className="px-4 py-3">
                                     {ticket.attachment_url ? (
                                         <a href={ticket.attachment_url} target="_blank" rel="noreferrer" className="text-blue-400 hover:underline text-xs">Lihat</a>

@@ -1,6 +1,6 @@
 import { redirect } from 'next/navigation';
 import { createClient } from '../../lib/supabase/server';
-import LogoutButton from '../components/LogoutButton';
+import LogoutButton from '../../components/LogoutButton';
 
 export const dynamic = 'force-dynamic';
 
