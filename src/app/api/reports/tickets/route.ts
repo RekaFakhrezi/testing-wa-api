@@ -67,7 +67,7 @@ export async function GET(request: Request) {
         'Teknisi'
     ].join(',');
 
-    const rows = (tickets || []).map(t => {
+    const rows = (tickets || []).map((t: any) => {
         const waktuMasuk = new Date(t.created_at).toLocaleString('id-ID');
         const waktuSelesai = t.resolved_at ? new Date(t.resolved_at).toLocaleString('id-ID') : '';
         

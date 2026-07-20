@@ -13,7 +13,7 @@ export async function POST(request: Request) {
         }
 
         // Get public user id
-        const { data: publicUser } = await supabaseService.from('users').select('id').eq('auth_id', authUser.id).single();
+        const { data: publicUser } = await supabaseService.from('users').select('id, name').eq('auth_id', authUser.id).single();
         if (!publicUser) {
             return NextResponse.json({ status: 'error', message: 'User not found in public database' }, { status: 401 });
         }
@@ -52,10 +52,10 @@ export async function POST(request: Request) {
         await createTicketLog(supabaseService, {
             ticket_id: ticketId,
             user_id: userId,
-            user_name: user?.name,
+            user_name: publicUser?.name,
             role: 'TEKNISI',
             action: 'ASSIGN_TECHNICIAN',
-            description: `Tiket diambil oleh teknisi ${user?.name || ''}`,
+            description: `Tiket diambil oleh teknisi ${publicUser?.name || ''}`,
             new_value: { technician_id: userId }
         });
 
