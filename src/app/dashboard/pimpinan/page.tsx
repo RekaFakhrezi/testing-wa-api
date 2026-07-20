@@ -20,7 +20,7 @@ export default async function PimpinanDashboard() {
     const completionRate = totalTickets > 0 ? Math.round((resolvedTickets / totalTickets) * 100) : 0;
 
     return (
-        <div className="p-8 max-w-7xl mx-auto min-h-screen bg-slate-900 text-slate-200">
+        <div className="p-8 max-w-7xl mx-auto h-full bg-slate-900 text-slate-200">
             {/* Header */}
             <div className="mb-10 p-8 bg-gradient-to-r from-purple-900/40 to-fuchsia-900/40 border border-purple-500/20 rounded-3xl flex items-center justify-between shadow-2xl relative overflow-hidden backdrop-blur-xl">
                 <div className="absolute -top-10 -right-10 w-48 h-48 bg-purple-500/30 rounded-full blur-3xl"></div>

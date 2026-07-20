@@ -1,20 +1,7 @@
 import { NextResponse } from 'next/server';
 import { supabaseService } from '@/src/lib/supabase/service';
-
-// Fungsi Kirim Pesan WA
-async function sendWhatsAppMessage(to: string, text: string) {
-    const url = 'https://www.wasenderapi.com/api/send-message';
-    const token = process.env.WASENDER_BEARER_TOKEN;
-
-    await fetch(url, {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({ to, text }),
-    }).catch(console.error);
-}
+import { sendTicketNotification } from '@/src/lib/services/notification';
+import { createTicketLog } from '@/src/lib/logger';
 
 export async function POST(request: Request) {
     try {
@@ -50,19 +37,37 @@ export async function POST(request: Request) {
 
         if (error) throw error;
 
-        // 3. Catat di audit log
-        await supabaseService.from('audit_logs').insert([{
+        // 3. Catat di audit log & ticket_messages
+        const userId = ticket.technician_id || ticket.reporter_id;
+        
+        await createTicketLog(supabaseService, {
             ticket_id: ticketId,
-            user_id: ticket.technician_id || ticket.reporter_id, // Harusnya ID teknisi yang login
-            action_type: 'TICKET_RESOLVED',
+            user_id: userId,
+            role: 'TEKNISI',
+            action: 'CLOSE_TICKET',
+            description: `Tiket diselesaikan. Solusi: ${solution.substring(0, 50)}...`,
             new_value: { ...updatedTicket, solution_note: solution } // Simpan solusi utuh di JSONB
-        }]);
+        });
+
+        await supabaseService.from('ticket_messages').insert({
+            ticket_id: ticketId,
+            sender_type: 'TEKNISI',
+            sender_id: userId,
+            message: `[TIKET DISELESAIKAN]\nSolusi: ${solution}`,
+            is_internal: false
+        });
 
         // 4. Kirim WA ke pelapor
         const pelaporPhone = ticket.reporter?.phone_number;
         if (pelaporPhone) {
-            const waMsg = `✅ *Tiket Selesai (#${ticket.ticket_number})*\n\nKendala Anda telah berhasil ditangani oleh teknisi kami.\n\n*Catatan Solusi:*\n_${solution}_\n\nJika Anda merasa masalah sudah benar-benar teratasi, silakan balas dengan ketik *ThanksDesk* untuk menutup sesi ini dan memberikan penilaian layanan (Survei).`;
-            await sendWhatsAppMessage(pelaporPhone, waMsg);
+            await supabaseService.from('wa_sessions').upsert({
+                phone_number: pelaporPhone,
+                step: 'AWAITING_TICKET_RESOLVED_CONFIRMATION',
+                temp_data: { ticket_id: ticketId, ticket_number: ticket.ticket_number },
+                updated_at: new Date().toISOString()
+            }, { onConflict: 'phone_number' });
+
+            await sendTicketNotification(ticket.ticket_number, 'Selesai/Close', pelaporPhone);
         }
 
         return NextResponse.json({ status: 'success' });

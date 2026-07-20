@@ -5,18 +5,18 @@ import { useRouter } from 'next/navigation';
 
 export default function OperatorActions({ 
     ticketId, 
-    technicians,
+    departments,
     categories,
     currentCategoryId
 }: { 
     ticketId: string, 
-    technicians: any[],
+    departments: any[],
     categories: any[],
     currentCategoryId: string
 }) {
     const [categoryId, setCategoryId] = useState(currentCategoryId || '');
     const [priority, setPriority] = useState('');
-    const [technicianId, setTechnicianId] = useState('');
+    const [departmentId, setDepartmentId] = useState('');
     const [isLoading, setIsLoading] = useState(false);
     const router = useRouter();
 
@@ -26,8 +26,8 @@ export default function OperatorActions({
                 alert('⚠️ Pilih prioritas SLA terlebih dahulu!');
                 return;
             }
-            if (!technicianId) {
-                alert('⚠️ Pilih Teknisi untuk mendisposisi tiket ini!');
+            if (!departmentId) {
+                alert('⚠️ Pilih Departemen untuk mendisposisi tiket ini!');
                 return;
             }
         }
@@ -43,7 +43,7 @@ export default function OperatorActions({
             const res = await fetch('/api/tickets/operator', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ ticketId, categoryId, priority, technicianId, actionType })
+                body: JSON.stringify({ ticketId, categoryId, priority, departmentId, actionType })
             });
 
             if (res.ok) {
@@ -61,12 +61,12 @@ export default function OperatorActions({
 
     return (
         <>
-            <td className="px-6 py-4 align-top">
+            <td className="px-4 py-3 align-middle">
                 <select
                     value={categoryId}
                     onChange={(e) => setCategoryId(e.target.value)}
                     disabled={isLoading}
-                    className="bg-white border border-slate-300 text-slate-700 text-xs rounded-md focus:ring-blue-500 focus:border-blue-500 block w-full min-w-[150px] p-2 disabled:opacity-50 outline-none"
+                    className="bg-white border border-slate-300 text-slate-700 text-xs rounded-md focus:ring-blue-500 focus:border-blue-500 block w-full max-w-[150px] p-2 disabled:opacity-50 outline-none truncate"
                 >
                     <option value="">Pilih Kategori...</option>
                     {categories.map((cat) => (
@@ -75,12 +75,12 @@ export default function OperatorActions({
                 </select>
             </td>
 
-            <td className="px-6 py-4 align-top">
+            <td className="px-4 py-3 align-middle">
                 <select
                     value={priority}
                     onChange={(e) => setPriority(e.target.value)}
                     disabled={isLoading}
-                    className="bg-white border border-slate-300 text-slate-700 text-xs rounded-md focus:ring-blue-500 focus:border-blue-500 block w-full min-w-[130px] p-2 disabled:opacity-50 outline-none"
+                    className="bg-white border border-slate-300 text-slate-700 text-xs rounded-md focus:ring-blue-500 focus:border-blue-500 block w-full max-w-[110px] p-2 disabled:opacity-50 outline-none"
                 >
                     <option value="">Pilih Prioritas...</option>
                     <option value="Kritis">🔴 Kritis</option>
@@ -90,36 +90,38 @@ export default function OperatorActions({
                 </select>
             </td>
 
-            <td className="px-6 py-4 align-top">
+            <td className="px-4 py-3 align-middle">
                 <select
-                    value={technicianId}
-                    onChange={(e) => setTechnicianId(e.target.value)}
+                    value={departmentId}
+                    onChange={(e) => setDepartmentId(e.target.value)}
                     disabled={isLoading}
-                    className="bg-white border border-slate-300 text-slate-700 text-xs rounded-md focus:ring-blue-500 focus:border-blue-500 block w-full min-w-[130px] p-2 disabled:opacity-50 outline-none"
+                    className="bg-white border border-slate-300 text-slate-700 text-xs rounded-md focus:ring-blue-500 focus:border-blue-500 block w-full max-w-[120px] p-2 disabled:opacity-50 outline-none truncate"
                 >
-                    <option value="">Pilih Teknisi...</option>
-                    {technicians.map((tech) => (
-                        <option key={tech.id} value={tech.id}>{tech.name}</option>
+                    <option value="">Pilih Unit...</option>
+                    {departments.map((dept) => (
+                        <option key={dept.id} value={dept.id}>{dept.name}</option>
                     ))}
                 </select>
             </td>
 
-            <td className="px-6 py-4 align-top text-right">
+            <td className="px-4 py-3 align-middle text-right whitespace-nowrap">
                 <div className="flex gap-2 justify-end">
                     <button
                         onClick={() => handleAction('accept')}
                         disabled={isLoading}
-                        className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold rounded-md transition-colors disabled:opacity-50 whitespace-nowrap"
+                        className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-lg font-semibold rounded-md transition-colors disabled:opacity-50 whitespace-nowrap"
+                        title="Terima"
                     >
-                        {isLoading ? '...' : 'Terima'}
+                        {isLoading ? '...' : '✓'}
                     </button>
 
                     <button
                         onClick={() => handleAction('reject')}
                         disabled={isLoading}
-                        className="px-3 py-1.5 bg-white border border-slate-300 hover:bg-red-50 hover:text-red-600 hover:border-red-200 text-slate-600 text-xs font-semibold rounded-md transition-colors disabled:opacity-50 whitespace-nowrap"
+                        className="px-3 py-1.5 bg-white border border-slate-300 hover:bg-red-50 hover:text-red-600 hover:border-red-200 text-slate-600 text-lg font-semibold rounded-md transition-colors disabled:opacity-50 whitespace-nowrap"
+                        title="Tolak"
                     >
-                        Tolak
+                        🗑
                     </button>
                 </div>
             </td>

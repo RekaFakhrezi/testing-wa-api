@@ -6,16 +6,18 @@ import OperatorActions from './OperatorActions';
 
 type Ticket = any; // simplified for this example
 type Category = { id: string, name: string };
-type Technician = { id: string, name: string };
+type Department = { id: string, name: string };
 
 export default function OperatorTicketTable({
     initialTickets,
     categories,
-    technicians
+    mainCategories,
+    departments
 }: {
     initialTickets: Ticket[],
     categories: Category[],
-    technicians: Technician[]
+    mainCategories: Category[],
+    departments: Department[]
 }) {
     // States for filters
     const [searchQuery, setSearchQuery] = useState('');
@@ -23,6 +25,10 @@ export default function OperatorTicketTable({
     const [startDate, setStartDate] = useState('');
     const [endDate, setEndDate] = useState('');
     const [showAdvanced, setShowAdvanced] = useState(false);
+
+    // Bulk action state
+    const [selectedTickets, setSelectedTickets] = useState<string[]>([]);
+    const [isBulkRejecting, setIsBulkRejecting] = useState(false);
 
     // States for sorting
     const [sortConfig, setSortConfig] = useState<{ key: string, direction: 'asc' | 'desc' } | null>(null);
@@ -34,6 +40,7 @@ export default function OperatorTicketTable({
         setStartDate('');
         setEndDate('');
         setSortConfig(null);
+        setSelectedTickets([]);
     };
 
     // Sorting handler
@@ -43,6 +50,86 @@ export default function OperatorTicketTable({
             direction = 'desc';
         }
         setSortConfig({ key, direction });
+    };
+
+    // Bulk actions
+    const handleSelectAll = (e: React.ChangeEvent<HTMLInputElement>) => {
+        if (e.target.checked) {
+            setSelectedTickets(processedTickets.map(t => t.id));
+        } else {
+            setSelectedTickets([]);
+        }
+    };
+
+    const handleSelect = (id: string) => {
+        if (selectedTickets.includes(id)) {
+            setSelectedTickets(selectedTickets.filter(tId => tId !== id));
+        } else {
+            setSelectedTickets([...selectedTickets, id]);
+        }
+    };
+
+    const handleBulkReject = async () => {
+        if (selectedTickets.length === 0) return;
+        if (!confirm(`Apakah Anda yakin ingin MENOLAK ${selectedTickets.length} tiket yang dipilih secara otomatis?`)) return;
+
+        setIsBulkRejecting(true);
+        try {
+            // Because we don't have a bulk API yet, we can Promise.all the existing endpoint for simplicity,
+            // or create a bulk endpoint. Since there's an existing endpoint, let's just loop.
+            const promises = selectedTickets.map(ticketId => 
+                fetch('/api/tickets/operator', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ 
+                        ticketId, 
+                        actionType: 'reject'
+                    })
+                })
+            );
+
+            await Promise.all(promises);
+            
+            // Reload page to reflect changes
+            window.location.reload();
+        } catch (error) {
+            console.error('Bulk reject error:', error);
+            alert('Terjadi kesalahan saat memproses bulk reject.');
+        } finally {
+            setIsBulkRejecting(false);
+            setSelectedTickets([]);
+        }
+    };
+
+    const handleExportCSV = () => {
+        if (processedTickets.length === 0) {
+            alert('Tidak ada data untuk diekspor.');
+            return;
+        }
+
+        const headers = ['No. Tiket', 'Waktu Masuk', 'Subjek', 'Status', 'Pelapor', 'Unit/Fakultas', 'Kategori', 'Overdue'];
+        
+        const rows = processedTickets.map(t => [
+            t.ticket_number,
+            new Date(t.created_at).toLocaleString('id-ID'),
+            `"${(t.subject || t.category?.name || 'Tanpa Subjek').replace(/"/g, '""')}"`,
+            t.status,
+            `"${(t.reporter?.name || '').replace(/"/g, '""')}"`,
+            `"${(t.reporter?.faculty_unit || '').replace(/"/g, '""')}"`,
+            `"${(t.category?.name || '').replace(/"/g, '""')}"`,
+            t.is_overdue ? 'Ya' : 'Tidak'
+        ]);
+
+        const csvContent = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
+        
+        const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.setAttribute('href', url);
+        link.setAttribute('download', `export_tiket_operator_${new Date().toISOString().split('T')[0]}.csv`);
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
     };
 
     // Filter and Sort Logic
@@ -122,13 +209,15 @@ export default function OperatorTicketTable({
                     <span className="absolute left-3 top-2.5 text-slate-400">🔍</span>
                 </div>
 
-                <select 
+                <select
                     value={selectedCategory}
                     onChange={(e) => setSelectedCategory(e.target.value)}
-                    className="py-2 px-3 border border-slate-300 rounded-lg text-sm text-slate-600 outline-none focus:border-blue-500"
+                    className="bg-white border border-slate-300 text-slate-700 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block p-2 outline-none"
                 >
                     <option value="">All Categories</option>
-                    {categories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                    {mainCategories.map((cat) => (
+                        <option key={cat.id} value={cat.id}>{cat.name}</option>
+                    ))}
                 </select>
 
                 <button 
@@ -145,8 +234,19 @@ export default function OperatorTicketTable({
                     ↺ Reset
                 </button>
 
-                <div className="ml-auto">
-                    <span className="text-sm text-slate-500 font-medium">Showing {processedTickets.length} tickets</span>
+                <div className="ml-auto flex items-center gap-3">
+                    {selectedTickets.length > 0 && (
+                        <button 
+                            onClick={handleBulkReject}
+                            disabled={isBulkRejecting}
+                            className="py-2 px-4 bg-red-600 border border-red-700 rounded-lg text-sm font-bold text-white hover:bg-red-700 transition-colors shadow-sm disabled:opacity-50"
+                        >
+                            {isBulkRejecting ? 'Memproses...' : `Tolak Terpilih (${selectedTickets.length})`}
+                        </button>
+                    )}
+                    <span className="text-sm text-slate-500 font-medium whitespace-nowrap hidden sm:block">
+                        Showing {processedTickets.length} tickets
+                    </span>
                 </div>
             </div>
 
@@ -175,54 +275,86 @@ export default function OperatorTicketTable({
                 <table className="w-full text-sm text-left">
                     <thead className="text-xs text-slate-500 bg-white border-b border-slate-200">
                         <tr>
-                            <th className="px-6 py-4 font-semibold cursor-pointer hover:bg-slate-50 transition-colors" onClick={() => requestSort('ticket_number')}>
-                                Ticket {getSortArrow('ticket_number')}
+                            <th className="px-4 py-3 font-semibold whitespace-nowrap w-10">
+                                <input 
+                                    type="checkbox" 
+                                    className="rounded border-slate-300 text-blue-600 focus:ring-blue-500 cursor-pointer"
+                                    checked={selectedTickets.length === processedTickets.length && processedTickets.length > 0}
+                                    onChange={handleSelectAll}
+                                />
                             </th>
-                            <th className="px-6 py-4 font-semibold cursor-pointer hover:bg-slate-50 transition-colors" onClick={() => requestSort('created_at')}>
-                                Last Updated {getSortArrow('created_at')}
+                            <th className="px-4 py-3 font-semibold cursor-pointer hover:bg-slate-50 transition-colors whitespace-nowrap" onClick={() => requestSort('ticket_number')}>
+                                <div className="flex items-center gap-1">Ticket {getSortArrow('ticket_number')}</div>
                             </th>
-                            <th className="px-6 py-4 font-semibold cursor-pointer hover:bg-slate-50 transition-colors" onClick={() => requestSort('subject')}>
-                                Subject {getSortArrow('subject')}
+                            <th className="px-4 py-3 font-semibold cursor-pointer hover:bg-slate-50 transition-colors whitespace-nowrap" onClick={() => requestSort('created_at')}>
+                                <div className="flex items-center gap-1">Last Updated {getSortArrow('created_at')}</div>
                             </th>
-                            <th className="px-6 py-4 font-semibold cursor-pointer hover:bg-slate-50 transition-colors" onClick={() => requestSort('reporter')}>
-                                From {getSortArrow('reporter')}
+                            <th className="px-4 py-3 font-semibold cursor-pointer hover:bg-slate-50 transition-colors whitespace-nowrap" onClick={() => requestSort('subject')}>
+                                <div className="flex items-center gap-1">Subject {getSortArrow('subject')}</div>
                             </th>
-                            <th className="px-6 py-4 font-semibold">Category</th>
-                            <th className="px-6 py-4 font-semibold">Priority</th>
-                            <th className="px-6 py-4 font-semibold">Assigned To</th>
-                            <th className="px-6 py-4 font-semibold text-right">Action</th>
+                            <th className="px-4 py-3 font-semibold whitespace-nowrap">Status</th>
+                            <th className="px-4 py-3 font-semibold cursor-pointer hover:bg-slate-50 transition-colors whitespace-nowrap" onClick={() => requestSort('reporter')}>
+                                <div className="flex items-center gap-1">From {getSortArrow('reporter')}</div>
+                            </th>
+                            <th className="px-4 py-3 font-semibold whitespace-nowrap">Category</th>
+                            <th className="px-4 py-3 font-semibold whitespace-nowrap">Priority</th>
+                            <th className="px-4 py-3 font-semibold whitespace-nowrap">Assigned To</th>
+                            <th className="px-4 py-3 font-semibold text-right whitespace-nowrap">Action</th>
                         </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100">
                         {processedTickets.length === 0 ? (
                             <tr>
-                                <td colSpan={8} className="text-center py-20 text-slate-400">
+                                <td colSpan={10} className="text-center py-20 text-slate-400">
                                     Tidak ada tiket yang sesuai dengan filter.
                                 </td>
                             </tr>
                         ) : (
                             processedTickets.map((ticket) => (
-                                <tr key={ticket.id} className="hover:bg-slate-50 transition-colors">
-                                    <td className="px-6 py-4 align-top">
+                                <tr key={ticket.id} className={`transition-colors ${selectedTickets.includes(ticket.id) ? 'bg-blue-50' : 'hover:bg-slate-50'}`}>
+                                    <td className="px-4 py-3 align-middle w-10">
+                                        <input 
+                                            type="checkbox" 
+                                            className="rounded border-slate-300 text-blue-600 focus:ring-blue-500 cursor-pointer"
+                                            checked={selectedTickets.includes(ticket.id)}
+                                            onChange={() => handleSelect(ticket.id)}
+                                        />
+                                    </td>
+                                    <td className="px-4 py-3 align-middle whitespace-nowrap">
                                         <Link href={`/dashboard/tickets/${ticket.ticket_number}`} className="font-semibold text-blue-600 hover:underline">
                                             {ticket.ticket_number}
                                         </Link>
                                     </td>
-                                    <td className="px-6 py-4 align-top text-slate-500 whitespace-nowrap">
-                                        {new Date(ticket.created_at).toISOString().split('T')[0]}<br/>
-                                        <span className="text-xs">{new Date(ticket.created_at).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' })}</span>
+                                    <td className="px-4 py-3 align-middle text-slate-500 whitespace-nowrap">
+                                        {new Date(ticket.created_at).toISOString().split('T')[0]} <span className="text-xs ml-1">{new Date(ticket.created_at).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' })}</span>
                                     </td>
-                                    <td className="px-6 py-4 align-top">
-                                        <Link href={`/dashboard/tickets/${ticket.ticket_number}`} className="font-semibold text-slate-800 hover:text-blue-600 hover:underline block mb-1">
+                                    <td className="px-4 py-3 align-middle">
+                                        <Link href={`/dashboard/tickets/${ticket.ticket_number}`} className="font-semibold text-slate-800 hover:text-blue-600 hover:underline block mb-1 leading-tight line-clamp-2">
                                             {ticket.subject || ticket.category?.name || 'Tanpa Subjek'}
                                         </Link>
                                     </td>
-                                    <td className="px-6 py-4 align-top whitespace-nowrap">
-                                        <div className="font-semibold text-slate-700">{ticket.reporter?.name}</div>
+                                    <td className="px-6 py-4 whitespace-nowrap">
+                                    <div className="flex flex-col gap-1 items-start">
+                                        <span className={`px-3 py-1 text-[10px] font-bold rounded-full uppercase tracking-wider ${
+                                            ticket.status === 'Open' ? 'bg-blue-100 text-blue-700' :
+                                            ticket.status === 'Diproses' ? 'bg-orange-100 text-orange-700' :
+                                            'bg-emerald-100 text-emerald-700'
+                                        }`}>
+                                            {ticket.status}
+                                        </span>
+                                        {ticket.is_overdue && (
+                                            <span className="px-3 py-0.5 text-[9px] font-black rounded-full uppercase tracking-widest bg-red-600 text-white shadow-sm shadow-red-200 animate-pulse">
+                                                OVERDUE
+                                            </span>
+                                        )}
+                                    </div>
+                                </td>
+                                    <td className="px-4 py-3 align-middle whitespace-nowrap">
+                                        <div className="font-semibold text-slate-700 leading-tight">{ticket.reporter?.name}</div>
                                     </td>
                                     <OperatorActions 
                                         ticketId={ticket.id} 
-                                        technicians={technicians} 
+                                        departments={departments} 
                                         categories={categories}
                                         currentCategoryId={ticket.category_id}
                                     />
@@ -231,6 +363,16 @@ export default function OperatorTicketTable({
                         )}
                     </tbody>
                 </table>
+            </div>
+
+            {/* Footer / Actions */}
+            <div className="p-4 border-t border-slate-200 bg-slate-50 flex justify-end">
+                <button 
+                    onClick={handleExportCSV}
+                    className="py-2 px-4 bg-emerald-600 border border-emerald-700 rounded-lg text-sm font-bold text-white hover:bg-emerald-700 transition-colors shadow-sm flex items-center gap-2"
+                >
+                    ⬇ Export CSV
+                </button>
             </div>
         </div>
     );

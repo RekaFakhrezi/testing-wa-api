@@ -1,15 +1,59 @@
 import { NextResponse } from 'next/server';
 import { supabaseService } from '@/src/lib/supabase/service';
+import { sendTicketNotification } from '@/src/lib/services/notification';
+import { createTicketLog } from '@/src/lib/logger';
 
 // --- UTILS ---
 async function sendWhatsAppMessage(to: string, text: string) {
+    let status = 'SUCCESS';
+    let errorMessage = null;
+
+    if (process.env.NEXT_PUBLIC_USE_SIMULATOR === 'true') {
+        await supabaseService.from('mock_wa_messages').insert({
+            phone_number: to,
+            message: text,
+            direction: 'out'
+        });
+        // Log to webhook_logs for simulator
+        await supabaseService.from('webhook_logs').insert({
+            direction: 'OUTGOING',
+            phone_number: to,
+            payload: text,
+            status: 'SUCCESS'
+        });
+        return; // Bypass WASender
+    }
+
     const url = 'https://www.wasenderapi.com/api/send-message';
     const token = process.env.WASENDER_BEARER_TOKEN;
-    await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ to, text }),
-    }).catch(console.error);
+
+    try {
+        const res = await fetch(url, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify({ to, text }),
+        });
+        if (!res.ok) {
+            status = 'FAILED';
+            errorMessage = await res.text();
+        }
+    } catch (e: any) {
+        status = 'FAILED';
+        errorMessage = e.message;
+        console.error(e);
+    }
+
+    // Insert Log
+    await supabaseService.from('webhook_logs').insert({
+        direction: 'OUTGOING',
+        phone_number: to,
+        payload: text,
+        status: status,
+        error_message: errorMessage
+    });
 }
 
 async function uploadMediaToSupabase(base64Data: string, mimeType: string, senderNumber: string): Promise<string | null> {
@@ -57,11 +101,43 @@ async function getOrCreateCategory(categoryName: string): Promise<string | null>
     return category.id;
 }
 
+async function extractAttachment(msg: any, senderNumber: string) {
+    let uploadedAttachmentUrl = null;
+    let fileName = null;
+    let mimeType = null;
+
+    const imageMsg = msg?.message?.imageMessage;
+    const docMsg = msg?.message?.documentMessage;
+
+    if (imageMsg) {
+        mimeType = imageMsg.mimetype || 'image/jpeg';
+        fileName = `image-${Date.now()}.jpg`;
+        const hdBase64 = await getDecryptedMediaBase64(msg);
+        if (hdBase64) {
+            uploadedAttachmentUrl = await uploadMediaToSupabase(hdBase64, mimeType, senderNumber);
+        } else if (imageMsg.jpegThumbnail) {
+            uploadedAttachmentUrl = await uploadMediaToSupabase(imageMsg.jpegThumbnail, mimeType, senderNumber);
+        }
+    } else if (docMsg) {
+        mimeType = docMsg.mimetype || 'application/pdf';
+        fileName = docMsg.fileName || `document-${Date.now()}.pdf`;
+        const hdBase64 = await getDecryptedMediaBase64(msg);
+        if (hdBase64) {
+            uploadedAttachmentUrl = await uploadMediaToSupabase(hdBase64, mimeType, senderNumber);
+        }
+    }
+    
+    if (uploadedAttachmentUrl) {
+        return { file_url: uploadedAttachmentUrl, file_name: fileName, mime_type: mimeType, file_size: 0 };
+    }
+    return null;
+}
+
 // --- WEBHOOK MAIN ROUTE ---
 export async function POST(request: Request) {
     try {
         const signature = request.headers.get('x-webhook-signature');
-        if (signature !== process.env.WASENDER_WEBHOOK_SECRET) {
+        if (signature !== process.env.WASENDER_WEBHOOK_SECRET && process.env.NEXT_PUBLIC_USE_SIMULATOR !== 'true') {
             return NextResponse.json({ error: 'Invalid signature' }, { status: 401 });
         }
 
@@ -74,6 +150,14 @@ export async function POST(request: Request) {
 
         if (!messageText || !senderNumber) return NextResponse.json({ status: 'ignored' });
         const textLower = messageText.toLowerCase();
+
+        // LOG INCOMING WEBHOOK
+        await supabaseService.from('webhook_logs').insert({
+            direction: 'INCOMING',
+            phone_number: senderNumber,
+            payload: messageText,
+            status: 'SUCCESS'
+        });
 
         // INIT USER & SESSION
         let { data: user } = await supabaseService.from('users').select('*').eq('phone_number', senderNumber).maybeSingle();
@@ -128,17 +212,35 @@ export async function POST(request: Request) {
                     await updateState('AWAITING_TAMBAH_INFO_NO');
                     await sendWhatsAppMessage(senderNumber, `➕ *Tambah Informasi Tiket*\nMasukkan Nomor Tiket yang ingin Anda tambahkan infonya.\n\nContoh: TKT-1234\n\n_Balas 0 untuk kembali_`);
                 } else if (textLower === '4') {
-                    await updateState('AWAITING_FAQ_L1');
-                    await sendWhatsAppMessage(senderNumber, `💡 *FAQ & Panduan*\nPilih topik:\n1. Aplikasi\n2. Website & Email\n3. Jaringan & Internet\n4. Cyber Security\n\n0. Kembali`);
+                    const { data: rootCategories } = await supabaseService.from('faq_categories')
+                        .select('*')
+                        .is('parent_id', null)
+                        .eq('is_active', true)
+                        .order('sort_order', { ascending: true });
+
+                    let msg = `💡 *FAQ & Panduan*\nPilih topik:\n`;
+                    const options: any = {};
+                    if (rootCategories) {
+                        rootCategories.forEach((cat, index) => {
+                            msg += `${index + 1}. ${cat.name}\n`;
+                            options[(index + 1).toString()] = { id: cat.id, name: cat.name, type: 'category' };
+                        });
+                    }
+                    msg += `\n0. Kembali`;
+
+                    await updateState('AWAITING_FAQ_CATEGORY', { 
+                        faq_options: options,
+                        faq_stack: [{ parent_id: null, name: 'FAQ & Panduan' }]
+                    });
+                    await sendWhatsAppMessage(senderNumber, msg);
                 } else if (textLower === '5') {
                     await sendWhatsAppMessage(senderNumber, `📞 *Hubungi Petugas*\nLokasi: Gedung DSTI Universitas Diponegoro\nJam Operasional: Senin - Jumat (08.00 - 16.00)\nTelepon: (024) 1234567\n\n_Ketik HaloDesk untuk menu utama._`);
-                } else if (textLower === '6') {
-                    await updateState('AWAITING_SURVEY_RATING');
-                    await sendWhatsAppMessage(senderNumber, `📊 *Survei Kepuasan*\nBerapa bintang yang Anda berikan untuk layanan kami? (1-5)\n\n1 = Sangat Buruk\n5 = Sangat Baik\n\n0. Kembali`);
                 } else if (textLower === '0') {
                     await sendWhatsAppMessage(senderNumber, `👋 Terima kasih telah menghubungi Helpdesk IT UNDIP. Sesi diakhiri.`);
                 } else {
-                    await sendWhatsAppMessage(senderNumber, `🤖 *Halo! Pusat Bantuan IT Universitas Diponegoro.*\nSilakan balas dengan *angka*:\n*1.* 📝 Buat Tiket\n*2.* 🔍 Cek Status\n*3.* ➕ Tambah Info\n*4.* 📚 FAQ & Panduan\n*5.* 📞 Hubungi Petugas\n*6.* 📊 Survei\n*0.* ❌ Akhiri\n\n⚠️ Jangan pernah mengirimkan Password / OTP!`);
+                    let { data: configData } = await supabaseService.from('system_configs').select('value').eq('key', 'bot_welcome_message').maybeSingle();
+                    const welcomeMsg = configData?.value || `🤖 *Halo! Pusat Bantuan IT Universitas Diponegoro.*\nSilakan balas dengan *angka*:\n*1.* 📝 Buat Tiket\n*2.* 🔍 Cek Status\n*3.* ➕ Tambah Info\n*4.* 📚 FAQ & Panduan\n*5.* 📞 Hubungi Petugas\n*0.* ❌ Akhiri\n\n⚠️ Jangan pernah mengirimkan Password / OTP!`;
+                    await sendWhatsAppMessage(senderNumber, welcomeMsg);
                 }
                 break;
             }
@@ -155,103 +257,119 @@ export async function POST(request: Request) {
                     await sendWhatsAppMessage(senderNumber, `⚠️ Format salah. Harus ada tanda strip (-).\nContoh: Budi - 211201 - FT\n0. Kembali`);
                     break;
                 }
-                await updateState('AWAITING_CAT_L1', { name: parts[0], nim: parts[1], faculty: parts[2] });
-                await sendWhatsAppMessage(senderNumber, `📌 *Kategori Layanan (Level 1)*\n1. Aplikasi\n2. Website dan Email\n3. Jaringan dan Internet\n4. Cyber Security\n0. Kembali`);
+                const { data: rootCategories } = await supabaseService.from('categories')
+                    .select('*')
+                    .is('parent_id', null)
+                    .eq('is_active', true)
+                    .order('sort_order', { ascending: true });
+
+                let msg = `📌 *Kategori Layanan*\n`;
+                const options: any = {};
+                if (rootCategories) {
+                    rootCategories.forEach((cat, index) => {
+                        msg += `${index + 1}. ${cat.name}\n`;
+                        options[(index + 1).toString()] = { id: cat.id, name: cat.name };
+                    });
+                }
+                msg += `0. Kembali`;
+
+                await updateState('AWAITING_CATEGORY', { 
+                    name: parts[0], nim: parts[1], faculty: parts[2],
+                    category_options: options,
+                    category_path: '',
+                    category_stack: [{ parent_id: null, name: 'Kategori Layanan' }]
+                });
+                await sendWhatsAppMessage(senderNumber, msg);
                 break;
             }
-            case 'AWAITING_CAT_L1': {
+            case 'AWAITING_CATEGORY': {
+                let stack = session.temp_data.category_stack || [{ parent_id: null, name: 'Kategori Layanan' }];
+
                 if (textLower === '0') {
-                    await updateState('IDLE');
-                    await sendWhatsAppMessage(senderNumber, `Kembali ke Menu Utama. Ketik HaloDesk.`);
+                    if (stack.length > 1) {
+                        stack.pop(); // remove current level
+                        const previous = stack[stack.length - 1];
+                        
+                        let query = supabaseService.from('categories').select('*').eq('is_active', true).order('sort_order', { ascending: true });
+                        if (previous.parent_id === null) {
+                            query = query.is('parent_id', null);
+                        } else {
+                            query = query.eq('parent_id', previous.parent_id);
+                        }
+                        
+                        const { data: prevCategories } = await query;
+                        
+                        let msg = previous.parent_id === null ? `📌 *Kategori Layanan*\n` : `📌 *Sub Kategori - ${previous.name}*\n`;
+                        const newOptions: any = {};
+                        if (prevCategories) {
+                            prevCategories.forEach((cat, index) => {
+                                msg += `${index + 1}. ${cat.name}\n`;
+                                newOptions[(index + 1).toString()] = { id: cat.id, name: cat.name };
+                            });
+                        }
+                        msg += `0. Kembali`;
+                        
+                        let pathParts = session.temp_data.category_path ? session.temp_data.category_path.split(' / ') : [];
+                        if (pathParts.length > 0) pathParts.pop();
+                        const newPath = pathParts.join(' / ');
+                        
+                        await updateState('AWAITING_CATEGORY', {
+                            ...session.temp_data,
+                            category_options: newOptions,
+                            category_stack: stack,
+                            category_path: newPath
+                        });
+                        await sendWhatsAppMessage(senderNumber, msg);
+                        break;
+                    } else {
+                        await updateState('IDLE');
+                        await sendWhatsAppMessage(senderNumber, `Kembali ke Menu Utama. Ketik HaloDesk.`);
+                        break;
+                    }
+                }
+
+                const options = session.temp_data.category_options || {};
+                const selected = options[textLower];
+
+                if (!selected) {
+                    await sendWhatsAppMessage(senderNumber, `⚠️ Pilihan tidak valid.`);
                     break;
                 }
-                if (textLower === '1') {
-                    await updateState('AWAITING_CAT_L2_APP');
-                    await sendWhatsAppMessage(senderNumber, `📂 *Aplikasi*\n1. SSO\n2. Gentayu\n3. Mandala\n4. E-Office\n5. Lainnya\n0. Kembali`);
-                } else if (textLower === '2') {
-                    await updateState('AWAITING_CAT_L2_WEB');
-                    await sendWhatsAppMessage(senderNumber, `📂 *Website dan Email*\n1. Domain\n2. Website\n3. Email\n4. Lisensi\n0. Kembali`);
-                } else if (textLower === '3') {
-                    await updateState('AWAITING_CAT_L2_NET');
-                    await sendWhatsAppMessage(senderNumber, `📂 *Jaringan dan Internet*\n1. WiFi\n2. VPN\n3. VM\n0. Kembali`);
-                } else if (textLower === '4') {
-                    await updateState('AWAITING_CAT_L2_SEC');
-                    await sendWhatsAppMessage(senderNumber, `📂 *Cyber dan Security*\n1. Backdoor\n2. Keamanan Sistem\n0. Kembali`);
+
+                // Check for children
+                const { data: childCategories } = await supabaseService.from('categories')
+                    .select('*')
+                    .eq('parent_id', selected.id)
+                    .eq('is_active', true)
+                    .order('sort_order', { ascending: true });
+
+                const newPath = session.temp_data.category_path ? `${session.temp_data.category_path} / ${selected.name}` : selected.name;
+
+                if (childCategories && childCategories.length > 0) {
+                    let msg = `📌 *Sub Kategori - ${selected.name}*\n`;
+                    const newOptions: any = {};
+                    childCategories.forEach((cat, index) => {
+                        msg += `${index + 1}. ${cat.name}\n`;
+                        newOptions[(index + 1).toString()] = { id: cat.id, name: cat.name };
+                    });
+                    msg += `0. Kembali`;
+
+                    stack.push({ parent_id: selected.id, name: selected.name });
+
+                    await updateState('AWAITING_CATEGORY', { 
+                        ...session.temp_data,
+                        category_options: newOptions,
+                        category_path: newPath,
+                        category_stack: stack
+                    });
+                    await sendWhatsAppMessage(senderNumber, msg);
                 } else {
-                    await sendWhatsAppMessage(senderNumber, `⚠️ Pilihan tidak valid.`);
-                }
-                break;
-            }
-            case 'AWAITING_CAT_L2_APP': {
-                if (textLower === '0') {
-                    await updateState('AWAITING_CAT_L1');
-                    await sendWhatsAppMessage(senderNumber, `📌 *Kategori Layanan (Level 1)*\n1. Aplikasi\n2. Website dan Email\n3. Jaringan dan Internet\n4. Cyber Security\n0. Kembali`);
-                } else if (textLower === '1') {
-                    await updateState('AWAITING_CAT_L3_SSO');
-                    await sendWhatsAppMessage(senderNumber, `📂 *Aplikasi > SSO*\n1. Pembuatan Akun\n2. Reset Akun\n3. Perubahan Profil\n4. Reset OTP\n5. SIAP\n0. Kembali`);
-                } else if (textLower === '2') {
-                    await updateState('AWAITING_CAT_L3_GENTAYU');
-                    await sendWhatsAppMessage(senderNumber, `📂 *Aplikasi > Gentayu*\n1. Gentayu Pegawai\n2. Gentayu Mahasiswa\n0. Kembali`);
-                } else if (['3','4','5'].includes(textLower)) {
-                    const topic = textLower === '3' ? 'Aplikasi - Mandala' : textLower === '4' ? 'Aplikasi - E-Office' : 'Aplikasi - Lainnya';
-                    await updateState('AWAITING_COMPLAINT', { topic });
-                    await sendWhatsAppMessage(senderNumber, `✍️ *Tulis Kendala Anda*\nAnda memilih: ${topic}\nSilakan ketik detail keluhan atau kirimkan screenshot.\n⚠️ Dilarang mengirim Password/OTP!`);
-                } else {
-                    await sendWhatsAppMessage(senderNumber, `⚠️ Pilihan tidak valid.`);
-                }
-                break;
-            }
-            case 'AWAITING_CAT_L3_SSO': {
-                if (textLower === '0') {
-                    await updateState('AWAITING_CAT_L2_APP');
-                    await sendWhatsAppMessage(senderNumber, `📂 *Aplikasi*\n1. SSO\n2. Gentayu\n3. Mandala\n4. E-Office\n5. Lainnya\n0. Kembali`);
-                } else if (textLower === '5') {
-                    await updateState('AWAITING_CAT_L4_SIAP');
-                    await sendWhatsAppMessage(senderNumber, `📂 *Aplikasi > SSO > SIAP*\n1. Perubahan Profil SIAP\n2. Perubahan Alamat SIAP\n0. Kembali`);
-                } else if (['1','2','3','4'].includes(textLower)) {
-                    const topics: any = { '1': 'Pembuatan Akun SSO', '2': 'Reset Akun SSO', '3': 'Perubahan Profil SSO', '4': 'Reset OTP' };
-                    await updateState('AWAITING_COMPLAINT', { topic: `Aplikasi - SSO - ${topics[textLower]}` });
-                    await sendWhatsAppMessage(senderNumber, `✍️ *Tulis Kendala Anda*\nSilakan ketik detail keluhan atau kirimkan screenshot.\n⚠️ Dilarang mengirim Password/OTP!`);
-                } else {
-                    await sendWhatsAppMessage(senderNumber, `⚠️ Pilihan tidak valid.`);
-                }
-                break;
-            }
-            case 'AWAITING_CAT_L4_SIAP': {
-                if (textLower === '0') {
-                    await updateState('AWAITING_CAT_L3_SSO');
-                    await sendWhatsAppMessage(senderNumber, `📂 *Aplikasi > SSO*\n1. Pembuatan Akun\n2. Reset Akun\n3. Perubahan Profil\n4. Reset OTP\n5. SIAP\n0. Kembali`);
-                } else if (['1','2'].includes(textLower)) {
-                    const topic = textLower === '1' ? 'Aplikasi - SSO - SIAP - Perubahan Profil' : 'Aplikasi - SSO - SIAP - Perubahan Alamat';
-                    await updateState('AWAITING_COMPLAINT', { topic });
-                    await sendWhatsAppMessage(senderNumber, `✍️ *Tulis Kendala Anda*\nSilakan ketik detail keluhan atau kirimkan screenshot.\n⚠️ Dilarang mengirim Password/OTP!`);
-                } else {
-                    await sendWhatsAppMessage(senderNumber, `⚠️ Pilihan tidak valid.`);
-                }
-                break;
-            }
-            case 'AWAITING_CAT_L3_GENTAYU':
-            case 'AWAITING_CAT_L2_WEB':
-            case 'AWAITING_CAT_L2_NET':
-            case 'AWAITING_CAT_L2_SEC': {
-                if (textLower === '0') {
-                    await updateState('AWAITING_CAT_L1'); // Simplified back
-                    await sendWhatsAppMessage(senderNumber, `📌 *Kategori Layanan (Level 1)*\n1. Aplikasi\n2. Website dan Email\n3. Jaringan dan Internet\n4. Cyber Security\n0. Kembali`);
-                } else {
-                    // For the sake of this prototype logic, any valid number input captures a generic topic
-                    let categoryMap: any = {
-                        'AWAITING_CAT_L3_GENTAYU': { '1': 'Gentayu Pegawai', '2': 'Gentayu Mahasiswa' },
-                        'AWAITING_CAT_L2_WEB': { '1': 'Domain', '2': 'Website', '3': 'Email', '4': 'Lisensi' },
-                        'AWAITING_CAT_L2_NET': { '1': 'WiFi', '2': 'VPN', '3': 'VM' },
-                        'AWAITING_CAT_L2_SEC': { '1': 'Backdoor', '2': 'Keamanan Sistem' },
-                    };
-                    const selected = categoryMap[session.step][textLower];
-                    if (selected) {
-                        await updateState('AWAITING_COMPLAINT', { topic: selected });
-                        await sendWhatsAppMessage(senderNumber, `✍️ *Tulis Kendala Anda*\nAnda memilih: ${selected}\nSilakan ketik detail keluhan atau kirimkan screenshot.\n⚠️ Dilarang mengirim Password/OTP!`);
-                    } else {
-                        await sendWhatsAppMessage(senderNumber, `⚠️ Pilihan tidak valid.`);
-                    }
+                    await updateState('AWAITING_COMPLAINT', { 
+                        ...session.temp_data, 
+                        topic: newPath,
+                        category_id: selected.id
+                    });
+                    await sendWhatsAppMessage(senderNumber, `✍️ *Tulis Kendala Anda*\nAnda memilih: ${newPath}\nSilakan ketik detail keluhan atau kirimkan screenshot dengan format:\n\n*Subject*\n\n*Detail Kendala*`);
                 }
                 break;
             }
@@ -262,10 +380,7 @@ export async function POST(request: Request) {
                     await sendWhatsAppMessage(senderNumber, `Kembali ke Menu Utama. Ketik HaloDesk.`);
                     break;
                 }
-                if (textLower.includes('password') || textLower.includes('otp') || textLower.includes('sandi')) {
-                    await sendWhatsAppMessage(senderNumber, `🚨 *PERINGATAN KEAMANAN (SEC-07)*\nSistem mendeteksi adanya indikasi pengiriman password/OTP. Mohon ulangi penjelasan Anda TANPA menyertakan data sensitif tersebut!`);
-                    break;
-                }
+
 
                 const fullText = messageText || '(Ada Lampiran)';
                 let complaintSubject = 'Tanpa Subjek';
@@ -280,48 +395,188 @@ export async function POST(request: Request) {
                     complaintSubject = fullText;
                 }
 
-                let uploadedAttachmentUrl = null;
-                const imageMsg = msg?.message?.imageMessage;
-
-                if (imageMsg) {
-                    const mimeType = imageMsg.mimetype || 'image/jpeg';
-                    const hdBase64 = await getDecryptedMediaBase64(msg);
-                    if (hdBase64) uploadedAttachmentUrl = await uploadMediaToSupabase(hdBase64, mimeType, senderNumber);
-                    else if (imageMsg.jpegThumbnail) uploadedAttachmentUrl = await uploadMediaToSupabase(imageMsg.jpegThumbnail, mimeType, senderNumber);
+                const newAttachment = await extractAttachment(msg, senderNumber);
+                const currentAttachments = session.temp_data.attachments || [];
+                if (newAttachment) {
+                    currentAttachments.push(newAttachment);
                 }
 
-                await updateState('AWAITING_CONFIRMATION', { subject: complaintSubject, complaint: complaintDesc, attachmentUrl: uploadedAttachmentUrl });
-                const { name, nim, faculty, topic } = session.temp_data;
-                await sendWhatsAppMessage(senderNumber, `📋 *RINGKASAN TIKET*\n👤 Nama: ${name}\n🏢 Unit: ${faculty}\n📌 Kategori: ${topic}\n🏷️ Subjek: ${complaintSubject}\n📝 Keluhan: ${complaintDesc}\n📎 Lampiran: ${uploadedAttachmentUrl ? 'Tersimpan' : '-'}\n\n1. KIRIM\n2. BATAL`);
+                // If user only sent an image without text (caption empty), WhatsApp text might be empty.
+                // We'll proceed to AWAITING_ATTACHMENT.
+                if (newAttachment || fullText !== '(Ada Lampiran)') {
+                    await updateState('AWAITING_ATTACHMENT', { 
+                        ...session.temp_data,
+                        subject: complaintSubject !== '(Ada Lampiran)' ? complaintSubject : session.temp_data.subject || 'Tanpa Subjek', 
+                        complaint: complaintDesc !== '(Ada Lampiran)' ? complaintDesc : session.temp_data.complaint || '', 
+                        attachments: currentAttachments
+                    });
+                    await sendWhatsAppMessage(senderNumber, `Keluhan diterima. ${currentAttachments.length > 0 ? `\n\n(${currentAttachments.length} lampiran tersimpan)` : ''}\n\nApakah ada tambahan lampiran (Gambar/PDF)?\nJika ada, silakan kirimkan sekarang.\nJika sudah selesai, balas *1* untuk Kirim Tiket.\nBalas *0* untuk Batal.`);
+                } else {
+                    await sendWhatsAppMessage(senderNumber, `⚠️ Format pesan tidak dikenali. Silakan ketik keluhan Anda atau kirim lampiran.`);
+                }
+                break;
+            }
+
+            case 'AWAITING_ATTACHMENT': {
+                if (textLower === '0') {
+                    await updateState('IDLE');
+                    await sendWhatsAppMessage(senderNumber, `Kembali ke Menu Utama. Ketik HaloDesk.`);
+                    break;
+                }
+
+                if (textLower === '1') {
+                    // Cek FAQ Recommendation dlu sebelum konfirmasi
+                    const { subject, complaint, attachments } = session.temp_data;
+                    const { data: recommendedFaqs } = await supabaseService.from('faqs')
+                        .select('*')
+                        .eq('is_active', true)
+                        .or(`title.ilike.%${subject}%,keywords.ilike.%${subject}%`)
+                        .limit(3);
+
+                    if (recommendedFaqs && recommendedFaqs.length > 0) {
+                        let msg = `--------------------------------\nKami menemukan panduan yang mungkin membantu:\n\n`;
+                        const options: any = {};
+                        recommendedFaqs.forEach((faq, index) => {
+                            msg += `${index + 1}. ${faq.title}\n`;
+                            options[(index + 1).toString()] = { id: faq.id, title: faq.title, content: faq.content, url: faq.url };
+                        });
+                        const lastIdx = recommendedFaqs.length + 1;
+                        msg += `${lastIdx}. Tetap Buat Ticket\n--------------------------------`;
+                        options[lastIdx.toString()] = { action: 'continue_ticket' };
+
+                        await updateState('AWAITING_FAQ_RECOMMENDATION', {
+                            ...session.temp_data,
+                            recommendation_options: options
+                        });
+                        await sendWhatsAppMessage(senderNumber, msg);
+                    } else {
+                        // Langsung konfirmasi
+                        await updateState('AWAITING_CONFIRMATION', { ...session.temp_data });
+                        const { name, nim, faculty, topic } = session.temp_data;
+                        await sendWhatsAppMessage(senderNumber, `📋 *RINGKASAN TIKET*\n👤 Nama: ${name}\n🏢 Unit: ${faculty}\n📌 Kategori: ${topic}\n🏷️ Subjek: ${subject}\n📝 Keluhan: ${complaint}\n📎 Lampiran: ${attachments?.length || 0} file\n\n1. KIRIM\n2. BATAL`);
+                    }
+                    break;
+                }
+
+                // Terus tampung lampiran
+                const newAttachment = await extractAttachment(msg, senderNumber);
+                if (newAttachment) {
+                    const currentAttachments = session.temp_data.attachments || [];
+                    currentAttachments.push(newAttachment);
+                    await updateState('AWAITING_ATTACHMENT', { ...session.temp_data, attachments: currentAttachments });
+                    await sendWhatsAppMessage(senderNumber, `✅ ${currentAttachments.length} lampiran berhasil diterima.\n\nKirim lampiran lagi, atau balas *1* untuk Kirim Tiket.\nBalas *0* untuk Batal.`);
+                } else {
+                    await sendWhatsAppMessage(senderNumber, `⚠️ File tidak didukung. Harap kirimkan Gambar atau PDF.\nBalas *1* untuk Kirim Tiket.`);
+                }
+                break;
+            }
+
+            case 'AWAITING_FAQ_RECOMMENDATION': {
+                const options = session.temp_data.recommendation_options || {};
+                const selected = options[textLower];
+
+                if (!selected) {
+                    await sendWhatsAppMessage(senderNumber, `⚠️ Pilihan tidak valid.`);
+                    break;
+                }
+
+                if (selected.action === 'continue_ticket') {
+                    await updateState('AWAITING_CONFIRMATION', { ...session.temp_data });
+                    const { name, faculty, topic, subject, complaint, attachments } = session.temp_data;
+                    await sendWhatsAppMessage(senderNumber, `📋 *RINGKASAN TIKET*\n👤 Nama: ${name}\n🏢 Unit: ${faculty}\n📌 Kategori: ${topic}\n🏷️ Subjek: ${subject}\n📝 Keluhan: ${complaint}\n📎 Lampiran: ${attachments?.length || 0} file\n\n1. KIRIM\n2. BATAL`);
+                } else {
+                    let msg = `📖 *${selected.title}*\n\n${selected.content}`;
+                    if (selected.url) msg += `\n\nLink referensi: ${selected.url}`;
+                    msg += `\n\n--------------------------------\nApakah masalah sudah selesai?\n1. Ya\n2. Belum`;
+                    
+                    await updateState('AWAITING_FAQ_RECOMMENDATION_CONFIRM', { ...session.temp_data });
+                    await sendWhatsAppMessage(senderNumber, msg);
+                }
+                break;
+            }
+
+            case 'AWAITING_FAQ_RECOMMENDATION_CONFIRM': {
+                if (textLower === '1') {
+                    await updateState('IDLE');
+                    await sendWhatsAppMessage(senderNumber, `✅ Selesai. Tiket dibatalkan karena masalah sudah teratasi oleh FAQ. Terima kasih!`);
+                } else if (textLower === '2') {
+                    await updateState('AWAITING_CONFIRMATION', { ...session.temp_data });
+                    const { name, faculty, topic, subject, complaint, attachments } = session.temp_data;
+                    await sendWhatsAppMessage(senderNumber, `📋 *RINGKASAN TIKET*\n👤 Nama: ${name}\n🏢 Unit: ${faculty}\n📌 Kategori: ${topic}\n🏷️ Subjek: ${subject}\n📝 Keluhan: ${complaint}\n📎 Lampiran: ${attachments?.length || 0} file\n\n1. KIRIM\n2. BATAL`);
+                } else {
+                    await sendWhatsAppMessage(senderNumber, `⚠️ Pilihan tidak valid. 1. Ya 2. Belum`);
+                }
                 break;
             }
 
             case 'AWAITING_CONFIRMATION': {
                 if (textLower === '1') {
-                    const { name, nim, faculty, topic, subject, complaint, attachmentUrl } = session.temp_data;
-                    const ticketNumber = `TKT-${Math.floor(1000 + Math.random() * 9000)}`;
+                    const { name, nim, faculty, topic, subject, complaint, attachments, category_id } = session.temp_data;
 
-                    const { data: savedUser } = await supabaseService.from('users').upsert({
-                        phone_number: senderNumber, name, identity_number: nim, faculty_unit: faculty, role: 'PELAPOR'
+                    // 2. Insert User (Upsert)
+                    const { data: user, error: userError } = await supabaseService.from('users').upsert({
+                        phone_number: senderNumber,
+                        name: name,
+                        identity_number: nim,
+                        faculty_unit: faculty,
+                        role: 'PELAPOR'
                     }, { onConflict: 'phone_number' }).select().single();
 
-                    const categoryId = await getOrCreateCategory(topic);
+                    if (userError) {
+                        console.error("User insert error:", userError);
+                        await sendWhatsAppMessage(senderNumber, `⚠️ Maaf, terjadi kesalahan sistem saat mendaftarkan data Anda.`);
+                        break;
+                    }
 
-                    const { error } = await supabaseService.from('tickets').insert([{
-                        ticket_number: ticketNumber,
-                        reporter_id: savedUser?.id,
-                        category_id: categoryId,
+                    // 3. Insert Ticket using category_id instead of string matching
+                    const { data: ticket, error: ticketError } = await supabaseService.from('tickets').insert({
+                        reporter_id: user.id,
+                        category_id: category_id,
                         subject: subject,
                         description: complaint,
-                        attachment_url: attachmentUrl,
-                        status: 'Open'
-                    }]);
+                        status: 'Open',
+                        attachment_url: attachments && attachments.length > 0 ? attachments[0].file_url : null // Backward compatibility
+                    }).select().single();
 
-                    if (error) {
+                    if (ticketError) {
+                        console.error("Ticket insert error:", ticketError);
                         await sendWhatsAppMessage(senderNumber, `❌ Gagal menyimpan tiket.`);
                     } else {
+                        // 4. Insert first message to ticket_messages
+                        const { data: firstMessage, error: msgError } = await supabaseService.from('ticket_messages').insert({
+                            ticket_id: ticket.id,
+                            sender_type: 'USER',
+                            sender_id: user.id,
+                            message: complaint,
+                            attachment_url: attachments && attachments.length > 0 ? attachments[0].file_url : null,
+                            is_internal: false
+                        }).select().single();
+
+                        if (!msgError && firstMessage && attachments && attachments.length > 0) {
+                            // Insert to ticket_attachments
+                            const attachmentsToInsert = attachments.map((att: any) => ({
+                                ticket_message_id: firstMessage.id,
+                                file_name: att.file_name,
+                                file_url: att.file_url,
+                                mime_type: att.mime_type,
+                                file_size: att.file_size,
+                                uploaded_by: user.id
+                            }));
+                            await supabaseService.from('ticket_attachments').insert(attachmentsToInsert);
+                        }
+
+                        // 5. Audit Log (Ticket Created)
+                        await createTicketLog(supabaseService, {
+                            ticket_id: ticket.id,
+                            user_id: user.id,
+                            user_name: name,
+                            role: 'USER',
+                            action: 'CREATE_TICKET',
+                            description: 'Tiket berhasil dibuat melalui WhatsApp',
+                        });
+
                         await updateState('IDLE');
-                        await sendWhatsAppMessage(senderNumber, `✅ *Tiket Berhasil Dibuat!*\nNomor Tiket Anda: *${ticketNumber}*\n\nTim Helpdesk akan segera memverifikasi laporan Anda. Gunakan menu 2 untuk mengecek status.`);
+                        await sendTicketNotification(ticket.ticket_number, 'Open', senderNumber);
                     }
                 } else if (textLower === '2' || textLower === '0') {
                     await updateState('IDLE');
@@ -375,52 +630,272 @@ export async function POST(request: Request) {
                     break;
                 }
                 const { ticket_id, ticketNum } = session.temp_data;
-                const appendText = `\n\n[INFO TAMBAHAN]: ${messageText}`;
-                
-                // Coba gunakan RPC jika ada
-                const { error: rpcError } = await supabaseService.rpc('append_ticket_description', { t_id: ticket_id, add_text: appendText });
-                
-                // Fallback manual jika RPC gagal/tidak ditemukan
-                if (rpcError) {
-                    const { data: oldT } = await supabaseService.from('tickets').select('description').eq('id', ticket_id).maybeSingle();
-                    if (oldT) {
-                        await supabaseService.from('tickets').update({ description: (oldT.description || '') + appendText }).eq('id', ticket_id);
-                    }
+                const fullText = messageText || '(Ada Lampiran)';
+
+                const newAttachment = await extractAttachment(msg, senderNumber);
+                const currentAttachments = session.temp_data.attachments || [];
+                if (newAttachment) {
+                    currentAttachments.push(newAttachment);
                 }
-                
-                await updateState('IDLE');
-                await sendWhatsAppMessage(senderNumber, `✅ Informasi berhasil ditambahkan ke tiket *${ticketNum}*. Operator/Teknisi akan segera mengeceknya.`);
+
+                if (newAttachment || fullText !== '(Ada Lampiran)') {
+                    await updateState('AWAITING_TAMBAH_INFO_ATTACHMENT', {
+                        ...session.temp_data,
+                        tambah_info_msg: fullText !== '(Ada Lampiran)' ? fullText : session.temp_data.tambah_info_msg || '',
+                        attachments: currentAttachments
+                    });
+                    await sendWhatsAppMessage(senderNumber, `Info diterima. ${currentAttachments.length > 0 ? `(${currentAttachments.length} lampiran tersimpan)` : ''}\n\nApakah ada tambahan lampiran (Gambar/PDF)?\nJika ada, silakan kirimkan sekarang.\nBalas *1* untuk Kirim Info.\nBalas *0* untuk Batal.`);
+                } else {
+                    await sendWhatsAppMessage(senderNumber, `⚠️ Format pesan tidak dikenali.`);
+                }
+                break;
+            }
+
+            case 'AWAITING_TAMBAH_INFO_ATTACHMENT': {
+                if (textLower === '0') {
+                    await updateState('IDLE');
+                    await sendWhatsAppMessage(senderNumber, `Batal tambah info.`);
+                    break;
+                }
+
+                if (textLower === '1') {
+                    const { ticket_id, ticketNum, tambah_info_msg, attachments } = session.temp_data;
+                    
+                    // Cek user pengirim (pelapor)
+                    const { data: user } = await supabaseService.from('users').select('id').eq('phone_number', senderNumber).maybeSingle();
+
+                    // Simpan pesan
+                    const { data: newMessage, error: msgError } = await supabaseService.from('ticket_messages').insert({
+                        ticket_id: ticket_id,
+                        sender_type: 'USER',
+                        sender_id: user?.id || null,
+                        message: tambah_info_msg || '(Mengirim Lampiran)',
+                        attachment_url: attachments && attachments.length > 0 ? attachments[0].file_url : null,
+                        is_internal: false
+                    }).select().single();
+
+                    if (!msgError && newMessage && attachments && attachments.length > 0) {
+                        const attachmentsToInsert = attachments.map((att: any) => ({
+                            ticket_message_id: newMessage.id,
+                            file_name: att.file_name,
+                            file_url: att.file_url,
+                            mime_type: att.mime_type,
+                            file_size: att.file_size,
+                            uploaded_by: user?.id || null
+                        }));
+                        await supabaseService.from('ticket_attachments').insert(attachmentsToInsert);
+                    }
+
+                    await createTicketLog(supabaseService, {
+                        ticket_id: ticket_id,
+                        user_id: user?.id,
+                        role: 'USER',
+                        action: 'REPLY_TICKET',
+                        description: `Pelapor menambahkan informasi baru (${attachments?.length || 0} lampiran).`,
+                    });
+                    
+                    await updateState('IDLE');
+                    await sendWhatsAppMessage(senderNumber, `✅ Informasi berhasil ditambahkan ke tiket *${ticketNum}*. Operator/Teknisi akan segera mengeceknya.`);
+                    break;
+                }
+
+                const newAttachment = await extractAttachment(msg, senderNumber);
+                if (newAttachment) {
+                    const currentAttachments = session.temp_data.attachments || [];
+                    currentAttachments.push(newAttachment);
+                    await updateState('AWAITING_TAMBAH_INFO_ATTACHMENT', { ...session.temp_data, attachments: currentAttachments });
+                    await sendWhatsAppMessage(senderNumber, `✅ ${currentAttachments.length} lampiran berhasil diterima.\n\nKirim lampiran lagi, atau balas *1* untuk Kirim Info.\nBalas *0* untuk Batal.`);
+                } else {
+                    await sendWhatsAppMessage(senderNumber, `⚠️ File tidak didukung. Harap kirimkan Gambar atau PDF.\nBalas *1* untuk Kirim Info.`);
+                }
                 break;
             }
 
             // --- ALUR 4: FAQ ---
-            case 'AWAITING_FAQ_L1': {
+            case 'AWAITING_FAQ_CATEGORY': {
+                let stack = session.temp_data.faq_stack || [{ parent_id: null, name: 'FAQ & Panduan' }];
+
                 if (textLower === '0') {
-                    await updateState('IDLE');
-                    await sendWhatsAppMessage(senderNumber, `Kembali ke Menu Utama.`);
-                } else if (['1','2','3','4'].includes(textLower)) {
-                    await updateState('IDLE');
-                    await sendWhatsAppMessage(senderNumber, `📚 *Panduan Anda*\nSilakan kunjungi portal panduan kami di:\nhttps://helpdesk.undip.ac.id/faq\n\nKetik HaloDesk untuk kembali.`);
-                } else {
+                    if (stack.length > 1) {
+                        stack.pop(); // remove current level
+                        const previous = stack[stack.length - 1];
+                        
+                        let query = supabaseService.from('faq_categories').select('*').eq('is_active', true).order('sort_order', { ascending: true });
+                        if (previous.parent_id === null) {
+                            query = query.is('parent_id', null);
+                        } else {
+                            query = query.eq('parent_id', previous.parent_id);
+                        }
+                        
+                        const { data: prevCategories } = await query;
+                        
+                        let msg = previous.parent_id === null ? `💡 *FAQ & Panduan*\nPilih topik:\n` : `📚 *FAQ - ${previous.name}*\n`;
+                        const newOptions: any = {};
+                        if (prevCategories) {
+                            prevCategories.forEach((cat, index) => {
+                                msg += `${index + 1}. ${cat.name}\n`;
+                                newOptions[(index + 1).toString()] = { id: cat.id, name: cat.name, type: 'category' };
+                            });
+                        }
+                        
+                        // If returning to a category that might also have FAQs (not just subcategories)
+                        // Actually, to keep it simple, we only fetch FAQs if no subcategories exist (or we just list both).
+                        // Let's assume if it has subcategories, we don't list FAQs, or we just list FAQs after categories.
+                        if (previous.parent_id !== null) {
+                            const { data: faqs } = await supabaseService.from('faqs').select('*').eq('category_id', previous.parent_id).eq('is_active', true).order('sort_order', { ascending: true });
+                            if (faqs && faqs.length > 0) {
+                                let offset = prevCategories ? prevCategories.length : 0;
+                                faqs.forEach((faq, idx) => {
+                                    msg += `${offset + idx + 1}. [FAQ] ${faq.title}\n`;
+                                    newOptions[(offset + idx + 1).toString()] = { id: faq.id, name: faq.title, type: 'faq', content: faq.content, url: faq.url };
+                                });
+                            }
+                        }
+
+                        msg += `\n0. Kembali`;
+                        
+                        await updateState('AWAITING_FAQ_CATEGORY', {
+                            ...session.temp_data,
+                            faq_options: newOptions,
+                            faq_stack: stack
+                        });
+                        await sendWhatsAppMessage(senderNumber, msg);
+                        break;
+                    } else {
+                        await updateState('IDLE');
+                        await sendWhatsAppMessage(senderNumber, `Kembali ke Menu Utama. Ketik HaloDesk.`);
+                        break;
+                    }
+                }
+
+                const options = session.temp_data.faq_options || {};
+                const selected = options[textLower];
+
+                if (!selected) {
                     await sendWhatsAppMessage(senderNumber, `⚠️ Pilihan tidak valid.`);
+                    break;
+                }
+
+                if (selected.type === 'faq') {
+                    let msg = `📖 *${selected.name}*\n\n${selected.content}`;
+                    if (selected.url) msg += `\n\nLink referensi: ${selected.url}`;
+                    msg += `\n\n0. Kembali`;
+                    
+                    // We don't push to stack for FAQ reading, just stay in AWAITING_FAQ_CATEGORY
+                    // But we need a dummy option for "0" to go back without reading FAQ options again.
+                    // Actually, if we just push the FAQ as a pseudo-level:
+                    stack.push({ parent_id: 'FAQ_ITEM', name: selected.name });
+                    await updateState('AWAITING_FAQ_CATEGORY', {
+                        ...session.temp_data,
+                        faq_options: {}, // Only 0 is valid
+                        faq_stack: stack
+                    });
+                    await sendWhatsAppMessage(senderNumber, msg);
+                } else if (selected.type === 'category') {
+                    // Check for subcategories
+                    const { data: childCategories } = await supabaseService.from('faq_categories')
+                        .select('*')
+                        .eq('parent_id', selected.id)
+                        .eq('is_active', true)
+                        .order('sort_order', { ascending: true });
+                        
+                    const { data: faqs } = await supabaseService.from('faqs')
+                        .select('*')
+                        .eq('category_id', selected.id)
+                        .eq('is_active', true)
+                        .order('sort_order', { ascending: true });
+
+                    let msg = `📚 *FAQ - ${selected.name}*\n\n`;
+                    const newOptions: any = {};
+                    let optionIdx = 1;
+                    
+                    if (childCategories && childCategories.length > 0) {
+                        childCategories.forEach((cat) => {
+                            msg += `${optionIdx}. ${cat.name}\n`;
+                            newOptions[optionIdx.toString()] = { id: cat.id, name: cat.name, type: 'category' };
+                            optionIdx++;
+                        });
+                    }
+                    
+                    if (faqs && faqs.length > 0) {
+                        faqs.forEach((faq) => {
+                            msg += `${optionIdx}. [FAQ] ${faq.title}\n`;
+                            newOptions[optionIdx.toString()] = { id: faq.id, name: faq.title, type: 'faq', content: faq.content, url: faq.url };
+                            optionIdx++;
+                        });
+                    }
+
+                    if (optionIdx === 1) {
+                        msg += `_Kategori ini masih kosong._\n`;
+                    }
+                    
+                    msg += `\n0. Kembali`;
+
+                    stack.push({ parent_id: selected.id, name: selected.name });
+
+                    await updateState('AWAITING_FAQ_CATEGORY', { 
+                        ...session.temp_data,
+                        faq_options: newOptions,
+                        faq_stack: stack
+                    });
+                    await sendWhatsAppMessage(senderNumber, msg);
                 }
                 break;
             }
 
-            // --- ALUR 6: SURVEI ---
+            // --- ALUR 6: SURVEI & RESOLVED ---
+            case 'AWAITING_TICKET_RESOLVED_CONFIRMATION': {
+                if (textLower === '1') {
+                    await updateState('AWAITING_SURVEY_RATING', { ...session.temp_data });
+                    await sendWhatsAppMessage(senderNumber, `📊 *Survei Kepuasan*\nBerapa bintang yang Anda berikan untuk layanan kami dalam menangani tiket ini? (1-5)\n\n1 = Sangat Buruk\n5 = Sangat Baik\n\n0. Lewati`);
+                } else if (textLower === '2') {
+                    // Kembalikan tiket ke Diproses
+                    const ticketId = session.temp_data.ticket_id;
+                    const ticketNum = session.temp_data.ticket_number;
+                    await supabaseService.from('tickets').update({ status: 'Diproses' }).eq('id', ticketId);
+                    
+                    await supabaseService.from('ticket_messages').insert({
+                        ticket_id: ticketId,
+                        sender_type: 'USER',
+                        sender_id: null,
+                        message: `[KENDALA BELUM SELESAI] Pelapor menyatakan kendala belum terselesaikan. Tiket dikembalikan ke status Diproses.`,
+                        is_internal: false
+                    });
+
+                    await updateState('IDLE');
+                    await sendTicketNotification(ticketNum, 'Dibuka Kembali/Reopen', senderNumber);
+                } else {
+                    await sendWhatsAppMessage(senderNumber, `⚠️ Pilihan tidak valid. Ketik 1 untuk Ya, 2 untuk Belum.`);
+                }
+                break;
+            }
+
             case 'AWAITING_SURVEY_RATING': {
                 if (textLower === '0') {
                     await updateState('IDLE');
-                    await sendWhatsAppMessage(senderNumber, `Kembali ke Menu Utama.`);
+                    await sendWhatsAppMessage(senderNumber, `Terima kasih! Sesi diakhiri.`);
                 } else if (['1','2','3','4','5'].includes(textLower)) {
-                    await updateState('AWAITING_SURVEY_SARAN', { rating: textLower });
-                    await sendWhatsAppMessage(senderNumber, `Terima kasih! Anda memberi rating ⭐ ${textLower}.\nSilakan ketik saran/masukan Anda untuk layanan kami.\n0. Lewati`);
+                    await updateState('AWAITING_SURVEY_SARAN', { ...session.temp_data, rating: parseInt(textLower) });
+                    await sendWhatsAppMessage(senderNumber, `Terima kasih! Anda memberi rating ⭐ ${textLower}.\nSilakan ketik saran/masukan Anda untuk layanan kami.\n\n0. Lewati`);
                 } else {
                     await sendWhatsAppMessage(senderNumber, `⚠️ Masukkan angka 1 sampai 5.`);
                 }
                 break;
             }
+
             case 'AWAITING_SURVEY_SARAN': {
+                const comment = textLower === '0' ? null : messageText;
+                const ticketId = session.temp_data.ticket_id;
+                const rating = session.temp_data.rating;
+
+                if (ticketId) {
+                    await supabaseService.from('ticket_feedback').insert({
+                        ticket_id: ticketId,
+                        rating: rating,
+                        comment: comment
+                    });
+                }
+
                 await updateState('IDLE');
                 await sendWhatsAppMessage(senderNumber, `✅ *Terima kasih!* Survei Anda telah disimpan. Masukan Anda sangat berarti bagi peningkatan layanan kami.\n\nKetik HaloDesk untuk kembali.`);
                 break;

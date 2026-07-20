@@ -1,25 +1,12 @@
 import { NextResponse } from 'next/server';
 import { supabaseService } from '@/src/lib/supabase/service';
-
-// Fungsi Kirim Pesan WA
-async function sendWhatsAppMessage(to: string, text: string) {
-    const url = 'https://www.wasenderapi.com/api/send-message';
-    const token = process.env.WASENDER_BEARER_TOKEN;
-
-    await fetch(url, {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({ to, text }),
-    }).catch(console.error);
-}
+import { sendTicketNotification } from '@/src/lib/services/notification';
+import { createTicketLog } from '@/src/lib/logger';
 
 export async function POST(request: Request) {
     try {
         const body = await request.json();
-        const { ticketId, categoryId, priority, technicianId, actionType } = body;
+        const { ticketId, categoryId, priority, departmentId, actionType } = body;
 
         if (!ticketId || !actionType) {
             return NextResponse.json({ status: 'error', message: 'Data tidak lengkap' }, { status: 400 });
@@ -32,7 +19,8 @@ export async function POST(request: Request) {
         const updatePayload: any = { status: newStatus };
         if (actionType === 'accept') {
             updatePayload.priority = priority;
-            updatePayload.technician_id = technicianId;
+            updatePayload.department_id = departmentId;
+            updatePayload.technician_id = null; // Reset if reassigned
             if (categoryId) updatePayload.category_id = categoryId;
         }
 
@@ -48,29 +36,25 @@ export async function POST(request: Request) {
 
         // Kirim Notifikasi WA ke Pelapor
         const pelaporPhone = updatedTicket.reporter?.phone_number;
-        const pelaporName = updatedTicket.reporter?.name;
         const ticketNum = updatedTicket.ticket_number;
 
         if (pelaporPhone) {
-            let waMsg = '';
-            if (actionType === 'accept') {
-                waMsg = `✅ *Tiket Diterima (#${ticketNum})*\n\nHalo ${pelaporName},\nLaporan Anda telah berhasil diverifikasi oleh Operator dan saat ini berstatus *${newStatus}*.\n\nTiket Anda sedang ditugaskan ke Teknisi kami dengan tingkat prioritas: *${priority}*.\n\n_Silakan tunggu pembaruan pesan otomatis dari Teknisi kami ya!_ 👷‍♂️`;
-            } else {
-                waMsg = `❌ *Tiket Ditolak (#${ticketNum})*\n\nHalo ${pelaporName},\nMohon maaf, tiket Anda telah ditolak atau dibatalkan oleh Operator Helpdesk.\n\nJika ini adalah sebuah kesalahan, silakan buat tiket baru dengan informasi yang lebih detail.`;
-            }
-            await sendWhatsAppMessage(pelaporPhone, waMsg);
+            await sendTicketNotification(ticketNum, newStatus, pelaporPhone);
         }
 
         // Mencatat log ke audit_logs
         const { data: adminUser } = await supabaseService.from('users').select('id').eq('role', 'OPERATOR_HELPDESK').limit(1).maybeSingle();
         const fallbackUserId = adminUser?.id || updatedTicket.reporter_id;
 
-        await supabaseService.from('audit_logs').insert([{
+        await createTicketLog(supabaseService, {
             ticket_id: ticketId,
-            user_id: fallbackUserId,
-            action_type: actionType === 'accept' ? 'TICKET_DISPATCHED' : 'TICKET_REJECTED',
+            user_id: adminUser?.id || null,
+            user_name: 'Operator',
+            role: 'HELPDESK',
+            action: actionType === 'accept' ? 'CHANGE_STATUS' : 'REJECT_TICKET',
+            description: actionType === 'accept' ? 'Tiket diterima dan diteruskan ke unit terkait' : 'Tiket ditolak oleh operator',
             new_value: updatedTicket
-        }]);
+        });
 
         return NextResponse.json({ status: 'success' });
 
