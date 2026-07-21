@@ -147,8 +147,9 @@ export async function POST(request: Request) {
         const msg = body.data?.messages;
         const messageText = typeof msg?.messageBody === 'string' ? msg.messageBody.trim() : '';
         const senderNumber = msg?.key?.cleanedSenderPn ?? msg?.key?.cleanedParticipantPn;
+        const hasMedia = !!(msg?.message?.imageMessage || msg?.message?.documentMessage);
 
-        if (!messageText || !senderNumber) return NextResponse.json({ status: 'ignored' });
+        if ((!messageText && !hasMedia) || !senderNumber) return NextResponse.json({ status: 'ignored' });
         const textLower = messageText.toLowerCase();
 
         // LOG INCOMING WEBHOOK
