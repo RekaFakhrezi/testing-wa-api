@@ -25,7 +25,7 @@ export default function DashboardSidebar({
         { label: 'Manajemen Pengguna', href: '/dashboard/admin/users', roles: ['ADMIN'] },
         { label: 'Kategori Laporan', href: '/dashboard/admin/categories', roles: ['ADMIN'] },
         { label: 'Manajemen SLA', href: '/dashboard/admin/sla', roles: ['ADMIN'] },
-        { label: 'Manajemen Teknisi', href: '/dashboard/admin/technicians', roles: ['ADMIN'] },
+        { label: 'Manajemen Staff', href: '/dashboard/admin/staff', roles: ['ADMIN'] },
         { label: 'Laporan & Ekspor', href: '/dashboard/admin/reports', roles: ['ADMIN'] },
         { label: 'Log API Webhook', href: '/dashboard/admin/logs', roles: ['ADMIN'] },
         { label: 'Pengaturan Sistem', href: '/dashboard/admin/settings', roles: ['ADMIN'] },
